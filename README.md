@@ -49,6 +49,26 @@ dynamic_depth_TN.tex      — LaTeX source for the technical note (if present)
 dynamic_depth_TN.pdf      — Compiled technical note (if present)
 ```
 
+## Run online (Colab, Kaggle)
+
+If your machine is limited, run the pipeline in the cloud with a free GPU:
+
+- **Google Colab (recommended):**
+  - **If the repo is public:** Open [this link](https://colab.research.google.com/github/giulioruffini/Compositional-NNs/blob/main/scripts/run_on_colab.ipynb) to open the notebook in Colab.
+  - **If the repo is private (or the link returns 404):** Colab cannot open private repos from GitHub. Instead: **File → Upload notebook** in Colab and upload `scripts/run_on_colab.ipynb` from your local clone. In the first code cell, comment the default clone line and uncomment the one that uses `https://YOUR_GITHUB_TOKEN@github.com/...` (create a token at [github.com/settings/tokens](https://github.com/settings/tokens)).
+  - In Colab: **Runtime → Change runtime type → GPU** (T4), then run the cells. The notebook clones the repo, installs deps, and runs a quick test; you can run a full training and download the results.
+
+- **Kaggle:** Create a new Notebook, set **Settings → Accelerator → GPU**, then in a cell run:
+  ```bash
+  !git clone https://github.com/giulioruffini/Compositional-NNs.git
+  %cd Compositional-NNs
+  !pip install -q torch torchvision pillow matplotlib numpy tqdm
+  !cd scripts && python train_and_evaluate.py --n_train 5000 --n_epochs 20 --img_size 128 --device cuda --output_dir ../results_kaggle
+  ```
+  Free GPU (P100) about 30 h/week.
+
+- **Paid GPU (long runs):** [Lambda Labs](https://lambdalabs.com), [RunPod](https://runpod.io), or [Vast.ai](https://vast.ai) offer cheap per-hour GPU instances. Clone the repo, install dependencies, and run the same commands as locally with `--device cuda`.
+
 ## Quickstart
 
 ### Setup
@@ -57,7 +77,7 @@ From the repo root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install torch torchvision pillow matplotlib numpy
+pip install torch torchvision pillow matplotlib numpy tqdm
 ```
 
 ### Generate a sample grid
