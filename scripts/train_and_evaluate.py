@@ -32,6 +32,7 @@ from PIL import Image
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from compositional_cat import (
     JointedCat, generate_dataset, CONDITIONS, LEVEL_PARAMS, sample_params
@@ -149,6 +150,8 @@ def train(
     gate_penalty: float = 0.01,
     device: str = 'cpu',
     log_every: int = 50,
+    job_pct_start: float = 15.0,
+    job_pct_end: float = 90.0,
 ) -> list:
     """Train the gated autoencoder on reconstruction with gate penalty.
 
@@ -160,6 +163,8 @@ def train(
         gate_penalty: Weight λ for the penalty Σ α_ℓ.
         device: 'cpu' or 'cuda'.
         log_every: Unused; kept for API compatibility.
+        job_pct_start: Job completion % at start of training (for progress bar).
+        job_pct_end: Job completion % at end of training.
 
     Returns:
         List of dicts, one per epoch, with keys: recon_loss, gate_loss, total_loss,
@@ -172,14 +177,30 @@ def train(
 
     history = []
 
-    for epoch in range(n_epochs):
+    epoch_pbar = tqdm(
+        range(n_epochs),
+        desc="Training",
+        unit="epoch",
+        leave=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for epoch in epoch_pbar:
+        epoch_pbar.set_postfix_str(f"Job {job_pct_start + (job_pct_end - job_pct_start) * ((epoch + 1) / max(1, n_epochs)):.0f}%")
+
         model.train()
         epoch_stats = {
             'recon_loss': 0, 'gate_loss': 0, 'total_loss': 0,
             'mean_gate': 0, 'effective_depth': 0, 'n_batches': 0
         }
 
-        for batch_idx, (x, _) in enumerate(train_loader):
+        batch_pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{n_epochs}",
+            leave=False,
+            unit="batch",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        )
+        for batch_idx, (x, _) in enumerate(batch_pbar):
             x = x.to(device)
             optimizer.zero_grad()
             loss, diag = model.compute_loss(x, gate_penalty=gate_penalty)
@@ -190,6 +211,10 @@ def train(
                        'mean_gate', 'effective_depth']:
                 epoch_stats[k] += diag[k]
             epoch_stats['n_batches'] += 1
+            batch_pbar.set_postfix_str(
+                f"loss={diag['total_loss']:.4f} D_eff={diag['effective_depth']:.2f}",
+                refresh=False,
+            )
 
         scheduler.step()
 
@@ -200,12 +225,10 @@ def train(
             epoch_stats[k] /= nb
 
         history.append(epoch_stats)
-
-        print(f"Epoch {epoch+1:3d}/{n_epochs} | "
-              f"recon={epoch_stats['recon_loss']:.4f} | "
-              f"gate={epoch_stats['gate_loss']:.4f} | "
-              f"D_eff={epoch_stats['effective_depth']:.2f} | "
-              f"mean_α={epoch_stats['mean_gate']:.3f}")
+        epoch_pbar.set_postfix_str(
+            f"recon={epoch_stats['recon_loss']:.4f} D_eff={epoch_stats['effective_depth']:.2f}",
+            refresh=True,
+        )
 
     return history
 
@@ -247,7 +270,7 @@ def evaluate_gates(
     all_gates = []  # list of (B, n_layers) arrays
     all_recon = []
 
-    for x, _ in loader:
+    for x, _ in tqdm(loader, desc=condition, leave=False, unit="batch"):
         x = x.to(device)
         x_recon, z, gates = model(x)
 
@@ -396,6 +419,8 @@ def main() -> None:
     parser.add_argument('--gate_init_bias', type=float, default=2.0)
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--num_workers', type=int, default=0,
+                       help='DataLoader workers. Use 4 on Kaggle/GPU so GPU is not starved by on-the-fly image generation.')
     parser.add_argument('--jobs_registry', type=str, default='../jobs/jobs_registry.json',
                        help='Path to central jobs registry JSON (from scripts/ default: ../jobs/...)')
     parser.add_argument('--calibrate', action='store_true',
@@ -463,21 +488,24 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
         'error': None,
     }
 
+    # Job progress: steps 1–6 with approximate weights: 1=5%, 2=5%, 3=75%, 4=10%, 5=5%
+    def _job_msg(pct: float, step: int, msg: str) -> None:
+        print(f"\nJob: {pct:.0f}% | Step {step}/6: {msg}")
+        print("=" * 60)
+
     # ── 1. Create training dataset (Everything condition) ──
-    print("=" * 60)
-    print("Step 1: Creating training dataset (Everything condition)")
-    print("=" * 60)
+    _job_msg(5, 1, "Creating training dataset (Everything condition)")
     train_dataset = CatDataset(
         'Everything', n_samples=args.n_train,
         img_size=args.img_size, seed=42
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        shuffle=True, num_workers=0
+        shuffle=True, num_workers=args.num_workers,
     )
 
     # ── 2. Build model ──
-    print("\nStep 2: Building Symmetry-Gated Autoencoder")
+    _job_msg(10, 2, "Building Symmetry-Gated Autoencoder")
     n_total_layers = args.n_stages * args.n_blocks
     print(f"  {args.n_stages} stages × {args.n_blocks} blocks = "
           f"{n_total_layers} gated layers")
@@ -496,9 +524,8 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
 
     # ── 3. Train ──
     n_epochs_run = 1 if args.calibrate else args.n_epochs
-    print(f"\nStep 3: Training for {n_epochs_run} epochs" +
-          (" (calibration: 1 epoch)" if args.calibrate else ""))
-    print("=" * 60)
+    _job_msg(15, 3, f"Training for {n_epochs_run} epochs" +
+             (" (calibration: 1 epoch)" if args.calibrate else ""))
     t_train_start = time.perf_counter()
     history = train(
         model, train_loader,
@@ -506,6 +533,8 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
         lr=args.lr,
         gate_penalty=args.gate_penalty,
         device=device,
+        job_pct_start=15.0,
+        job_pct_end=90.0,
     )
     time_train_sec = time.perf_counter() - t_train_start
 
@@ -542,9 +571,7 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
                os.path.join(args.output_dir, 'gated_autoencoder.pt'))
 
     # ── 4. Evaluate on all conditions ──
-    print("\n" + "=" * 60)
-    print("Step 4: Evaluating gate patterns on all conditions")
-    print("=" * 60)
+    _job_msg(90, 4, "Evaluating gate patterns on all conditions")
 
     eval_conditions = [
         'Static', 'CameraOnly', 'CameraBody', 'CameraBodySpine',
@@ -552,9 +579,12 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
     ]
 
     results = []
-    for cond in eval_conditions:
-        print(f"\n  Evaluating: {cond} "
-              f"(active levels: {CONDITIONS[cond]})")
+    for cond in tqdm(
+        eval_conditions,
+        desc="Conditions",
+        unit="cond",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    ):
         r = evaluate_gates(
             model, cond,
             n_samples=args.n_eval,
@@ -562,24 +592,21 @@ def _run_pipeline(args, device: str, job_id: str, start_time: float, start_iso: 
             device=device,
         )
         results.append(r)
-        print(f"    D_eff = {r['effective_depth_mean']:.2f} ± "
-              f"{r['effective_depth_std']:.2f}")
-        print(f"    Recon MSE = {r['recon_error_mean']:.4f}")
-        gate_str = ' '.join(f'{g:.2f}' for g in r['gate_means'])
-        print(f"    Gates: [{gate_str}]")
+        tqdm.write(
+            f"  {cond}: D_eff={r['effective_depth_mean']:.2f} ± {r['effective_depth_std']:.2f} "
+            f"| Recon MSE={r['recon_error_mean']:.4f}"
+        )
 
     # Save results
     with open(os.path.join(args.output_dir, 'gate_analysis.json'), 'w') as f:
         json.dump(results, f, indent=2)
 
     # ── 5. Plot ──
-    print("\n" + "=" * 60)
-    print("Step 5: Generating plots")
-    print("=" * 60)
+    _job_msg(95, 5, "Generating plots")
     plot_results(results, output_dir=args.output_dir)
 
     # ── 6. Summary ──
-    print("\n" + "=" * 60)
+    _job_msg(100, 6, "Done – summary")
     print("SUMMARY: Depth-Complexity Relationship")
     print("=" * 60)
     print(f"{'Condition':<20s} {'Active':>7s} {'D_eff':>8s} {'Recon':>8s}")

@@ -58,14 +58,15 @@ If your machine is limited, run the pipeline in the cloud with a free GPU:
   - **If the repo is private (or the link returns 404):** Colab cannot open private repos from GitHub. Instead: **File → Upload notebook** in Colab and upload `scripts/run_on_colab.ipynb` from your local clone. In the first code cell, comment the default clone line and uncomment the one that uses `https://YOUR_GITHUB_TOKEN@github.com/...` (create a token at [github.com/settings/tokens](https://github.com/settings/tokens)).
   - In Colab: **Runtime → Change runtime type → GPU** (T4), then run the cells. The notebook clones the repo, installs deps, and runs a quick test; you can run a full training and download the results.
 
-- **Kaggle:** Create a new Notebook, set **Settings → Accelerator → GPU**, then in a cell run:
-  ```bash
+- **Kaggle:** Create a new Notebook, then in the **right sidebar → Settings** turn **Accelerator** to **GPU** and **Internet** to **On**. Use **`--device cuda`**. Do **not** run `pip install torch` on Kaggle—it can replace the pre-installed GPU PyTorch with a CPU-only build. Only install packages Kaggle may be missing (e.g. `tqdm`). Example:
+  ```python
   !git clone https://github.com/giulioruffini/Compositional-NNs.git
   %cd Compositional-NNs
-  !pip install -q torch torchvision pillow matplotlib numpy tqdm
-  !cd scripts && python train_and_evaluate.py --n_train 5000 --n_epochs 20 --img_size 128 --device cuda --output_dir ../results_kaggle
+  !pip install -q tqdm
+  !cd scripts && python train_and_evaluate.py --n_train 5000 --n_eval 500 --n_epochs 20 --img_size 128 --batch_size 64 --device cuda --num_workers 4 --output_dir ../results_kaggle
   ```
-  Free GPU (P100) about 30 h/week.
+  Use **`--num_workers 4`** so the DataLoader prefetches batches in parallel; otherwise the GPU sits idle waiting for on-the-fly image generation.
+  To confirm the GPU is used, run `import torch; print(torch.cuda.is_available())` — it should print `True`. Free GPU (P100) about 30 h/week. If your repo is private, use a token in the URL: `!git clone https://YOUR_TOKEN@github.com/giulioruffini/Compositional-NNs.git`
 
 - **Paid GPU (long runs):** [Lambda Labs](https://lambdalabs.com), [RunPod](https://runpod.io), or [Vast.ai](https://vast.ai) offer cheap per-hour GPU instances. Clone the repo, install dependencies, and run the same commands as locally with `--device cuda`.
 
