@@ -1,20 +1,33 @@
 """
-Symmetry-Gated ResNet — v3
+Symmetry-Gated ResNet — v5
 ===========================
-Key fix: The non-gated parts of the encoder (stem, downsampling convs)
-are now MINIMAL — just channel projections and spatial pooling.
-ALL feature extraction capacity lives in the gated residual blocks.
-This forces the model to keep gates open when processing is needed.
+Fully convolutional autoencoder with binary multiplicative gates.
+
+Key insight: earlier versions had an FC bottleneck (encoder FC → latent vector
+→ decoder FC → spatial map). The decoder FC could decode rich spatial maps
+from a flat (non-spatial) code, circumventing the gates entirely.
+
+v5 fix: FULLY CONVOLUTIONAL — no FC layers. The latent is a spatial feature
+map (B, C_latent, S, S). When gates destroy spatial info → encoder outputs
+constant maps → decoder (bilinear + 1×1 only) CANNOT recreate spatial detail.
+The model MUST keep gates open to preserve spatial features.
+
+Binary gates via Gumbel-Softmax force discrete ON/OFF decisions.
+Gate penalty acts as a "cost per layer" budget.
+Complex images need more layers → higher D_eff.
 
 Architecture:
-  - Stem: 1×1 conv (channel projection only, no spatial features)
-  - Gated blocks: 3×3 convs (the ONLY spatial processing)
-  - Downsampling: AvgPool2d + 1×1 conv (no spatial features)
+  Encoder:  1×1 stem → [gated 3×3 blocks + AvgPool+1×1 downsample]×N → 1×1 to latent
+  Latent:   (B, latent_channels, S, S) — spatial feature map, not vector
+  Decoder:  1×1 from latent → [bilinear ×2 + 1×1]×N → 1×1 to RGB
 
 Gate:
-  α_ℓ = σ(W · [AvgPool(h_ℓ), StdPool(h_ℓ)] + b)
+  logit_ℓ = MLP([AvgPool(h_ℓ), StdPool(h_ℓ)])
+  α_ℓ ∈ {0, 1} via Gumbel-Softmax
+  ON:  h' = h + Δ(h)    — full residual with spatial features
+  OFF: h' = μ(h)         — only channel means, spatial info destroyed
 
-Author: G. Ruffini / Technical Note companion code — v3
+Author: G. Ruffini / Technical Note companion code — v5
 """
 
 import torch
@@ -24,51 +37,102 @@ from typing import List, Tuple, Optional
 
 
 # ═══════════════════════════════════════════════════════════
-# Gate module
+# Gumbel-Softmax utilities
+# ═══════════════════════════════════════════════════════════
+
+def gumbel_sigmoid(logit: torch.Tensor, tau: float = 1.0, hard: bool = True) -> torch.Tensor:
+    """
+    Binary Gumbel-Softmax (Gumbel-Bernoulli).
+
+    Samples from Bernoulli(σ(logit)) using reparametrization trick.
+    """
+    if not logit.requires_grad or not torch.is_grad_enabled():
+        # Eval mode: hard threshold
+        return (logit > 0.0).float()
+
+    u = torch.rand_like(logit).clamp(1e-6, 1 - 1e-6)
+    gumbel = torch.log(u) - torch.log(1 - u)
+    y_soft = torch.sigmoid((logit + gumbel) / tau)
+
+    if hard:
+        y_hard = (y_soft > 0.5).float()
+        return y_hard - y_soft.detach() + y_soft
+    return y_soft
+
+
+# ═══════════════════════════════════════════════════════════
+# Gate module — binary via Gumbel-Softmax
 # ═══════════════════════════════════════════════════════════
 
 class LayerGate(nn.Module):
     """
-    α_ℓ = σ(W · [AvgPool(h_ℓ), StdPool(h_ℓ)] + b)
+    Binary gate: α_ℓ ∈ {0, 1} via Gumbel-Softmax.
 
-    Spatial std gives the gate a direct signal of geometric complexity.
+    Input: [AvgPool(h), StdPool(h)] → MLP → logit → Gumbel-Bernoulli
     """
-    def __init__(self, channels: int, init_bias: float = 2.0):
+    def __init__(self, channels: int, init_bias: float = 0.0, tau: float = 1.0):
         super().__init__()
+        self.tau = tau
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(2 * channels, 1)
-        nn.init.zeros_(self.fc.weight)
-        nn.init.constant_(self.fc.bias, init_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg = self.pool(x).flatten(1)             # (B, C)
-        std = x.flatten(2).std(dim=2)             # (B, C)
-        features = torch.cat([avg, std], dim=1)   # (B, 2C)
-        gate = torch.sigmoid(self.fc(features))   # (B, 1)
-        return gate.view(-1, 1, 1, 1)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(2 * channels, channels),
+            nn.ReLU(),
+            nn.Linear(channels, 1),
+        )
+
+        # Xavier init so gate CAN learn from features
+        nn.init.xavier_normal_(self.gate_mlp[0].weight)
+        nn.init.zeros_(self.gate_mlp[0].bias)
+        nn.init.xavier_normal_(self.gate_mlp[2].weight)
+        nn.init.constant_(self.gate_mlp[2].bias, init_bias)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        avg = self.pool(x).flatten(1)
+        std = x.flatten(2).std(dim=2)
+        features = torch.cat([avg, std], dim=1)
+
+        logit = self.gate_mlp(features)
+        logit_4d = logit.view(-1, 1, 1, 1)
+
+        gate = gumbel_sigmoid(logit_4d, tau=self.tau, hard=True)
+        prob = torch.sigmoid(logit).squeeze(-1)
+        return gate, prob
 
 
 # ═══════════════════════════════════════════════════════════
-# Gated residual block (unchanged from v2)
+# Gated residual block — binary multiplicative gating
 # ═══════════════════════════════════════════════════════════
 
 class GatedResBlock(nn.Module):
-    """h' = h + α(h) · Δ(h). The ONLY layers with 3×3 convolutions."""
-    def __init__(self, channels: int, gate_init_bias: float = 2.0):
+    """
+    Binary multiplicative gating.
+
+    ON  (α=1):  h' = ReLU(h + Δ(h))     — full residual block
+    OFF (α=0):  h' = ReLU(μ(h))          — spatial info destroyed
+    """
+    def __init__(self, channels: int, gate_init_bias: float = 0.0, gate_tau: float = 1.0):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
-        self.gate = LayerGate(channels, init_bias=gate_init_bias)
+        self.gate = LayerGate(channels, init_bias=gate_init_bias, tau=gate_tau)
+        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = F.relu(self.bn1(self.conv1(x)))
         residual = self.bn2(self.conv2(residual))
-        alpha = self.gate(x)
-        out = x + alpha * residual
+
+        gate_binary, gate_prob = self.gate(x)
+
+        h_full = x + residual
+        h_mean = self.spatial_pool(x).expand_as(x)
+
+        out = gate_binary * h_full + (1.0 - gate_binary) * h_mean
         out = F.relu(out)
-        return out, alpha.squeeze()
+
+        return out, gate_prob
 
 
 class ResBlock(nn.Module):
@@ -87,38 +151,37 @@ class ResBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# Encoder — v3: minimal non-gated capacity
+# Fully Convolutional Encoder
 # ═══════════════════════════════════════════════════════════
 
 class GatedEncoder(nn.Module):
     """
-    Encoder with MINIMAL non-gated capacity.
+    Fully convolutional encoder — NO FC layers.
 
-    - Stem: 1×1 conv (channel projection, no spatial features)
-    - Gated blocks: 3×3 convs (ALL spatial processing here)
-    - Downsampling: AvgPool + 1×1 conv (no 3×3 spatial features)
+    Spatial information flows through spatial feature maps.
+    No FC to circumvent gates.
 
-    This forces the gated blocks to be the primary feature extractors.
-    When gates close, the model loses spatial processing power.
+    Output: (B, latent_channels, S, S) spatial latent.
     """
     def __init__(
         self,
         img_size: int = 128,
-        latent_dim: int = 64,
+        latent_dim: int = 8,      # now latent CHANNELS (spatial)
         base_channels: int = 32,
         n_blocks_per_stage: int = 2,
         n_stages: int = 4,
         gated: bool = True,
-        gate_init_bias: float = 2.0,
+        gate_init_bias: float = 0.0,
+        gate_tau: float = 1.0,
     ):
         super().__init__()
         self.gated = gated
         self.n_stages = n_stages
         self.n_blocks_per_stage = n_blocks_per_stage
 
-        # MINIMAL stem: 1×1 conv only (no spatial features!)
+        # MINIMAL stem: 1×1 conv only
         self.stem = nn.Sequential(
-            nn.Conv2d(3, base_channels, 1, bias=False),  # 1×1 only!
+            nn.Conv2d(3, base_channels, 1, bias=False),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(),
         )
@@ -131,17 +194,16 @@ class GatedEncoder(nn.Module):
             blocks = nn.ModuleList()
             for b in range(n_blocks_per_stage):
                 if gated:
-                    blocks.append(GatedResBlock(ch, gate_init_bias))
+                    blocks.append(GatedResBlock(ch, gate_init_bias, gate_tau))
                 else:
                     blocks.append(ResBlock(ch))
             self.stages.append(blocks)
 
             if stage < n_stages - 1:
                 next_ch = ch * 2
-                # MINIMAL downsample: AvgPool + 1×1 conv (no spatial features!)
                 self.downsamples.append(nn.Sequential(
                     nn.AvgPool2d(2),
-                    nn.Conv2d(ch, next_ch, 1, bias=False),  # 1×1 only!
+                    nn.Conv2d(ch, next_ch, 1, bias=False),
                     nn.BatchNorm2d(next_ch),
                     nn.ReLU(),
                 ))
@@ -155,10 +217,15 @@ class GatedEncoder(nn.Module):
             spatial = spatial // 2
         self.final_spatial = spatial
 
-        self.fc = nn.Linear(ch * spatial * spatial, latent_dim)
+        # 1×1 conv to latent channels (NO FC!)
+        self.to_latent = nn.Sequential(
+            nn.Conv2d(ch, latent_dim, 1, bias=False),
+            nn.BatchNorm2d(latent_dim),
+        )
+        self.latent_dim = latent_dim
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        gates = []
+        gate_probs = []
         h = self.stem(x)
 
         for stage_idx, (blocks, down) in enumerate(
@@ -166,70 +233,70 @@ class GatedEncoder(nn.Module):
         ):
             for block in blocks:
                 if self.gated:
-                    h, alpha = block(h)
-                    gates.append(alpha)
+                    h, prob = block(h)
+                    gate_probs.append(prob)
                 else:
                     h = block(h)
 
             if stage_idx < self.n_stages - 1:
                 h = down(h)
 
-        z = self.fc(h.flatten(1))
-        return z, gates
+        z = self.to_latent(h)  # (B, latent_ch, S, S) — spatial!
+        return z, gate_probs
 
 
 # ═══════════════════════════════════════════════════════════
-# Decoder
+# Fully Convolutional Decoder
 # ═══════════════════════════════════════════════════════════
 
 class Decoder(nn.Module):
     """
-    MINIMAL decoder: latent → reconstructed image.
+    Fully convolutional decoder — NO FC layers.
 
-    Uses bilinear upsampling + 1×1 conv for channel reduction.
-    NO 3×3 convolutions — the decoder cannot compensate for a weak
-    encoder. This forces the encoder's gated 3×3 blocks to extract
-    good spatial features.
+    latent (B, latent_ch, S, S) → bilinear upsample + 1×1 conv → RGB
+
+    Because there's no FC, the decoder CANNOT create spatial detail
+    that wasn't present in the encoder output. It can only:
+    - Upsample (bilinear interpolation — smooth, no new detail)
+    - Mix channels (1×1 conv — per-pixel, no spatial processing)
     """
     def __init__(
         self,
         img_size: int = 128,
-        latent_dim: int = 64,
+        latent_dim: int = 8,      # latent channels
         base_channels: int = 32,
         n_stages: int = 4,
     ):
         super().__init__()
 
         final_ch = base_channels * (2 ** (n_stages - 1))
-        spatial = img_size
-        for _ in range(n_stages - 1):
-            spatial = spatial // 2
-
-        self.fc = nn.Linear(latent_dim, final_ch * spatial * spatial)
-        self.initial_shape = (final_ch, spatial, spatial)
         self.n_stages = n_stages
 
-        # 1×1 channel reduction at each upsampling stage
+        # 1×1 from latent channels to decoder channels (NO FC!)
+        self.from_latent = nn.Sequential(
+            nn.Conv2d(latent_dim, final_ch, 1, bias=False),
+            nn.BatchNorm2d(final_ch),
+            nn.ReLU(),
+        )
+
         self.channel_reduce = nn.ModuleList()
         ch = final_ch
         for stage in range(n_stages - 1):
             next_ch = ch // 2
             self.channel_reduce.append(nn.Sequential(
-                nn.Conv2d(ch, next_ch, 1, bias=False),  # 1×1 only!
+                nn.Conv2d(ch, next_ch, 1, bias=False),
                 nn.BatchNorm2d(next_ch),
                 nn.ReLU(),
             ))
             ch = next_ch
 
-        # Final 1×1 to RGB
         self.to_rgb = nn.Sequential(
-            nn.Conv2d(ch, 3, 1),  # 1×1 only!
+            nn.Conv2d(ch, 3, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.fc(z)
-        h = h.view(-1, *self.initial_shape)
+        h = self.from_latent(z)
 
         for reduce in self.channel_reduce:
             h = F.interpolate(h, scale_factor=2, mode='bilinear',
@@ -244,16 +311,21 @@ class Decoder(nn.Module):
 # ═══════════════════════════════════════════════════════════
 
 class GatedAutoencoder(nn.Module):
-    """Autoencoder with gated encoder. Loss = MSE + λ·Σα_ℓ."""
+    """
+    Fully convolutional autoencoder with binary-gated encoder.
+
+    Loss = MSE + λ · mean(Σ_ℓ prob_ℓ)
+    """
     def __init__(
         self,
         img_size: int = 128,
-        latent_dim: int = 64,
+        latent_dim: int = 8,
         base_channels: int = 32,
         n_blocks_per_stage: int = 2,
         n_stages: int = 4,
         gated: bool = True,
-        gate_init_bias: float = 2.0,
+        gate_init_bias: float = 0.0,
+        gate_tau: float = 1.0,
     ):
         super().__init__()
         self.encoder = GatedEncoder(
@@ -264,6 +336,7 @@ class GatedAutoencoder(nn.Module):
             n_stages=n_stages,
             gated=gated,
             gate_init_bias=gate_init_bias,
+            gate_tau=gate_tau,
         )
         self.decoder = Decoder(
             img_size=img_size,
@@ -274,9 +347,9 @@ class GatedAutoencoder(nn.Module):
         self.gated = gated
 
     def forward(self, x: torch.Tensor):
-        z, gates = self.encoder(x)
+        z, gate_probs = self.encoder(x)
         x_recon = self.decoder(z)
-        return x_recon, z, gates
+        return x_recon, z, gate_probs
 
     def compute_loss(
         self,
@@ -286,32 +359,20 @@ class GatedAutoencoder(nn.Module):
         max_levels: int = 7,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Loss = MSE + λ_eff · Σ_ℓ α_ℓ
+        Loss = MSE + λ · mean(Σ_ℓ prob_ℓ)
 
-        If n_levels is provided (per-sample complexity), the gate penalty
-        is scaled: λ_eff(sample) = λ · (max_levels - n_levels + 1) / max_levels.
-        Simpler inputs get stronger penalty → encourages them to close gates.
-        Complex inputs get weaker penalty → allows them to keep gates open.
+        Penalty on gate probabilities (smooth) while forward uses hard gates.
         """
-        x_recon, z, gates = self.forward(x)
+        x_recon, z, gate_probs = self.forward(x)
         recon_loss = F.mse_loss(x_recon, x)
 
-        if self.gated and len(gates) > 0:
-            # gates[ℓ] has shape (B,) — per-sample gate values
-            gate_stack = torch.stack(gates, dim=1)  # (B, L)
-            per_sample_sum = gate_stack.sum(dim=1)  # (B,)
+        if self.gated and len(gate_probs) > 0:
+            prob_stack = torch.stack(gate_probs, dim=1)
+            per_sample_sum = prob_stack.sum(dim=1)
 
-            if n_levels is not None:
-                # Per-sample scaling: simpler → stronger penalty
-                n_lev = n_levels.float().to(x.device)
-                scale = (max_levels - n_lev + 1) / max_levels  # (B,)
-                # scale ranges from 1/7 (Everything) to 8/7 (Static)
-                weighted_sum = (scale * per_sample_sum).mean()
-            else:
-                weighted_sum = per_sample_sum.mean()
+            gate_loss = gate_penalty * per_sample_sum.mean()
 
-            gate_loss = gate_penalty * weighted_sum
-            n_layers = len(gates)
+            n_layers = len(gate_probs)
             gate_mean = per_sample_sum.mean().item() / n_layers
         else:
             gate_loss = torch.tensor(0.0, device=x.device)
@@ -326,8 +387,8 @@ class GatedAutoencoder(nn.Module):
             'recon_loss': recon_loss.item(),
             'gate_loss': gate_loss.item(),
             'mean_gate': gate_mean,
-            'effective_depth': per_sample_sum.mean().item() if self.gated and len(gates) > 0 else float(n_layers),
-            'gate_values': [g.mean().item() for g in gates] if gates else [],
+            'effective_depth': per_sample_sum.mean().item() if self.gated and len(gate_probs) > 0 else float(n_layers),
+            'gate_values': [g.mean().item() for g in gate_probs] if gate_probs else [],
         }
         return total_loss, diagnostics
 

@@ -24,6 +24,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from pathlib import Path
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -38,6 +39,25 @@ from gated_resnet import GatedAutoencoder
 # Datasets
 # ═══════════════════════════════════════════════════════════
 
+def apply_complexity_blur(arr: np.ndarray, n_levels: int, max_blur: float = 3.0, max_levels: int = 7) -> np.ndarray:
+    """
+    Apply Gaussian blur inversely proportional to condition level.
+
+    This creates a per-image visual complexity gradient:
+      Level 0: heavy blur → only large-scale features → simple
+      Level 7: no blur   → full spatial detail → complex
+
+    This directly tests the compositional depth hypothesis:
+    more compositional levels → more spatial frequency content
+    → more processing depth needed.
+    """
+    sigma = max_blur * (1.0 - n_levels / max_levels)
+    if sigma > 0.1:
+        for c in range(arr.shape[2]):
+            arr[:, :, c] = gaussian_filter(arr[:, :, c], sigma=sigma)
+    return arr
+
+
 class CatDataset(Dataset):
     """On-the-fly cat image generation for a single condition."""
 
@@ -47,11 +67,13 @@ class CatDataset(Dataset):
         n_samples: int = 5000,
         img_size: int = 64,
         seed: int = 42,
+        max_blur: float = 3.0,
     ):
         self.condition = condition
         self.active_levels = CONDITIONS[condition]
         self.n_samples = n_samples
         self.img_size = img_size
+        self.max_blur = max_blur
         self.rng = np.random.RandomState(seed)
 
         self.all_params = []
@@ -68,6 +90,7 @@ class CatDataset(Dataset):
         cat.params = self.all_params[idx]
         img = cat.render(img_size=self.img_size)
         arr = np.array(img, dtype=np.float32) / 255.0
+        arr = apply_complexity_blur(arr, len(self.active_levels), self.max_blur)
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
         return tensor, len(self.active_levels)
 
@@ -92,8 +115,10 @@ class MixedConditionDataset(Dataset):
         n_samples_per_condition: int = 1000,
         img_size: int = 64,
         seed: int = 42,
+        max_blur: float = 3.0,
     ):
         self.img_size = img_size
+        self.max_blur = max_blur
         self.conditions = self.TRAIN_CONDITIONS
         self.n_per_cond = n_samples_per_condition
         self.total = len(self.conditions) * n_samples_per_condition
@@ -124,6 +149,7 @@ class MixedConditionDataset(Dataset):
         cat.params = self.all_params[idx]
         img = cat.render(img_size=self.img_size)
         arr = np.array(img, dtype=np.float32) / 255.0
+        arr = apply_complexity_blur(arr, self.all_n_levels[idx], self.max_blur)
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
         return tensor, self.all_n_levels[idx]
 
@@ -175,7 +201,7 @@ def train(
             n_lev = n_levels.to(device) if isinstance(n_levels, torch.Tensor) else torch.tensor(n_levels, device=device)
             optimizer.zero_grad()
             loss, diag = model.compute_loss(
-                x, gate_penalty=gate_penalty, n_levels=n_lev
+                x, gate_penalty=gate_penalty,
             )
             loss.backward()
             optimizer.step()
@@ -216,13 +242,14 @@ def evaluate_gates(
     img_size: int = 64,
     device: str = 'cpu',
     seed: int = 999,
+    max_blur: float = 3.0,
 ) -> dict:
     """Evaluate gate activations on a specific condition."""
     model.eval()
     model.to(device)
 
     dataset = CatDataset(condition, n_samples=n_samples,
-                         img_size=img_size, seed=seed)
+                         img_size=img_size, seed=seed, max_blur=max_blur)
     loader = DataLoader(dataset, batch_size=64, shuffle=False)
 
     all_gates = []
@@ -379,11 +406,15 @@ def main():
     parser.add_argument('--n_epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--gate_penalty', type=float, default=0.05,
+    parser.add_argument('--gate_penalty', type=float, default=0.0005,
                        help='Max gate penalty (ramped during warmup)')
     parser.add_argument('--gate_warmup', type=int, default=10,
                        help='Epochs to ramp gate penalty from 0 to max')
     parser.add_argument('--gate_init_bias', type=float, default=2.0)
+    parser.add_argument('--gate_tau', type=float, default=1.0,
+                       help='Gumbel-Softmax temperature (lower = more binary)')
+    parser.add_argument('--max_blur', type=float, default=3.0,
+                       help='Max Gaussian blur sigma (level 0 gets this, level 7 gets 0)')
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
@@ -399,6 +430,7 @@ def main():
         n_samples_per_condition=args.n_train_per_cond,
         img_size=args.img_size,
         seed=42,
+        max_blur=args.max_blur,
     )
     total_train = len(train_dataset)
     print(f"  {len(MixedConditionDataset.TRAIN_CONDITIONS)} conditions × "
@@ -424,6 +456,7 @@ def main():
         n_stages=args.n_stages,
         gated=True,
         gate_init_bias=args.gate_init_bias,
+        gate_tau=args.gate_tau,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {n_params:,}")
@@ -467,6 +500,7 @@ def main():
             n_samples=args.n_eval,
             img_size=args.img_size,
             device=device,
+            max_blur=args.max_blur,
         )
         results.append(r)
         print(f"    D_eff = {r['effective_depth_mean']:.2f} ± "
