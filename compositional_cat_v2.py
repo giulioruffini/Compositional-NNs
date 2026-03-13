@@ -293,15 +293,15 @@ class JointedCat:
 
 LEVEL_PARAMS = {
     1: {  # Camera — affects EVERYTHING including background
-        'cam_angle':  (-0.6, 0.6),       # was ±0.3
-        'cam_tx':     (-0.5, 0.5),       # was ±0.4
-        'cam_ty':     (-0.5, 0.5),
-        'cam_scale':  (0.6, 1.5),        # was 0.7–1.4
+        'cam_angle':  (-0.4, 0.4),       # tightened to keep cat in frame
+        'cam_tx':     (-0.25, 0.25),     # tightened (was ±0.5)
+        'cam_ty':     (-0.25, 0.25),     # tightened (was ±0.5)
+        'cam_scale':  (0.7, 1.3),        # tightened (was 0.6–1.5)
     },
     2: {  # Root body — moves cat within frame (NOT background)
-        'root_x':     (-0.7, 0.7),       # was ±0.5
-        'root_y':     (-0.5, 0.5),       # was ±0.3
-        'root_angle': (-0.8, 0.8),       # was ±0.5
+        'root_x':     (-0.4, 0.4),       # tightened (was ±0.7)
+        'root_y':     (-0.3, 0.3),       # tightened (was ±0.5)
+        'root_angle': (-0.8, 0.8),       # rotation is fine
     },
     3: {  # Spine — much bendier
         'spine_0': (-0.7, 0.7),          # was ±0.4
@@ -352,13 +352,59 @@ CONDITIONS = {
 }
 
 
-def sample_params(active_levels: List[int], rng: np.random.RandomState) -> Dict[str, float]:
+def _check_in_frame(params: Dict[str, float], margin: float = 0.15) -> bool:
+    """Check that most of the cat skeleton is within the frame.
+
+    Returns True if the bounding box of all skeleton joints falls
+    within [margin, 1-margin] of the normalised image coordinates.
+    This rejects configurations where the cat is mostly off-screen.
+    """
     cat = JointedCat()
-    params = dict(cat.params)
-    for level in active_levels:
-        if level in LEVEL_PARAMS:
-            for param_name, (lo, hi) in LEVEL_PARAMS[level].items():
-                params[param_name] = rng.uniform(lo, hi)
+    cat.params = params
+    chains = cat.compute_skeleton()
+
+    # Collect all joint positions
+    all_pts = []
+    for chain in chains.values():
+        all_pts.extend(chain)
+    if not all_pts:
+        return True
+
+    pts = np.array(all_pts)  # (N, 2)
+
+    # Apply camera transform (same as render())
+    WORLD_SCALE = 0.55
+    scaled = params['cam_scale'] * pts
+    R = rot2d(params['cam_angle'])
+    rotated = (R @ scaled.T).T
+    translated = rotated + np.array([params['cam_tx'], params['cam_ty']])
+    # Convert to normalised [0, 1] image coordinates
+    nx = 0.5 + translated[:, 0] * WORLD_SCALE
+    ny = 0.5 - translated[:, 1] * WORLD_SCALE
+
+    # Check that the centroid is within bounds and at least half the
+    # joints are within the padded frame
+    cx, cy = nx.mean(), ny.mean()
+    if not (margin < cx < 1 - margin and margin < cy < 1 - margin):
+        return False
+    in_frame = ((nx > -margin) & (nx < 1 + margin) &
+                (ny > -margin) & (ny < 1 + margin))
+    return in_frame.mean() > 0.6
+
+
+def sample_params(active_levels: List[int], rng: np.random.RandomState,
+                  max_attempts: int = 20) -> Dict[str, float]:
+    """Sample parameters, rejecting configs where the cat is off-screen."""
+    for _ in range(max_attempts):
+        cat = JointedCat()
+        params = dict(cat.params)
+        for level in active_levels:
+            if level in LEVEL_PARAMS:
+                for param_name, (lo, hi) in LEVEL_PARAMS[level].items():
+                    params[param_name] = rng.uniform(lo, hi)
+        if _check_in_frame(params):
+            return params
+    # If we exhausted attempts, return last sample anyway
     return params
 
 
