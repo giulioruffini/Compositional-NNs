@@ -183,7 +183,14 @@ class GatedEncoder(nn.Module):
 # ═══════════════════════════════════════════════════════════
 
 class Decoder(nn.Module):
-    """Decoder: latent → reconstructed image. Mirror of encoder."""
+    """
+    MINIMAL decoder: latent → reconstructed image.
+
+    Uses bilinear upsampling + 1×1 conv for channel reduction.
+    NO 3×3 convolutions — the decoder cannot compensate for a weak
+    encoder. This forces the encoder's gated 3×3 blocks to extract
+    good spatial features.
+    """
     def __init__(
         self,
         img_size: int = 128,
@@ -200,29 +207,36 @@ class Decoder(nn.Module):
 
         self.fc = nn.Linear(latent_dim, final_ch * spatial * spatial)
         self.initial_shape = (final_ch, spatial, spatial)
+        self.n_stages = n_stages
 
-        layers = []
+        # 1×1 channel reduction at each upsampling stage
+        self.channel_reduce = nn.ModuleList()
         ch = final_ch
         for stage in range(n_stages - 1):
             next_ch = ch // 2
-            layers.extend([
-                nn.ConvTranspose2d(ch, next_ch, 4, stride=2, padding=1, bias=False),
+            self.channel_reduce.append(nn.Sequential(
+                nn.Conv2d(ch, next_ch, 1, bias=False),  # 1×1 only!
                 nn.BatchNorm2d(next_ch),
                 nn.ReLU(),
-                nn.Conv2d(next_ch, next_ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(next_ch),
-                nn.ReLU(),
-            ])
+            ))
             ch = next_ch
 
-        layers.append(nn.Conv2d(ch, 3, 3, padding=1))
-        layers.append(nn.Sigmoid())
-        self.net = nn.Sequential(*layers)
+        # Final 1×1 to RGB
+        self.to_rgb = nn.Sequential(
+            nn.Conv2d(ch, 3, 1),  # 1×1 only!
+            nn.Sigmoid(),
+        )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         h = self.fc(z)
         h = h.view(-1, *self.initial_shape)
-        return self.net(h)
+
+        for reduce in self.channel_reduce:
+            h = F.interpolate(h, scale_factor=2, mode='bilinear',
+                              align_corners=False)
+            h = reduce(h)
+
+        return self.to_rgb(h)
 
 
 # ═══════════════════════════════════════════════════════════

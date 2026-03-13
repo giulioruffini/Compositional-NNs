@@ -160,7 +160,7 @@ class JointedCat:
 
         # ── Camera transform ──
         # KEY CHANGE: scale factor 0.55 (was 0.35) — cat fills much more of the frame
-        WORLD_SCALE = 0.55
+        WORLD_SCALE = 0.40
 
         def world_to_pixel(pt: np.ndarray) -> Tuple[float, float]:
             scaled = p['cam_scale'] * pt
@@ -372,8 +372,8 @@ def _check_in_frame(params: Dict[str, float], margin: float = 0.15) -> bool:
 
     pts = np.array(all_pts)  # (N, 2)
 
-    # Apply camera transform (same as render())
-    WORLD_SCALE = 0.55
+    # Apply camera transform (must match render())
+    WORLD_SCALE = 0.40
     scaled = params['cam_scale'] * pts
     R = rot2d(params['cam_angle'])
     rotated = (R @ scaled.T).T
