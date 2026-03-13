@@ -1,0 +1,658 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── packages ──────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!70!black,citecolor=blue!70!black,urlcolor=blue!70!black}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathmorphing}
+
+% ── theorem environments ──────────────────────────────────
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+% ── macros ────────────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\cC}{\mathcal{C}}
+\newcommand{\cM}{\mathcal{M}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\fh}{\mathfrak{h}}
+\newcommand{\fg}{\mathfrak{g}}
+\DeclareMathOperator{\Lie}{Lie}
+\DeclareMathOperator{\Ad}{Ad}
+\DeclareMathOperator{\Pool}{Pool}
+\DeclareMathOperator{\diag}{diag}
+
+% ══════════════════════════════════════════════════════════
+\title{\textbf{Compositional Dynamic Depth in Neural Networks}\\[4pt]
+\large A Symmetry-Theoretic Foundation and Experimental Programme}
+\author{Giulio Ruffini\\
+\small Neuroelectrics, Starlab -- Barcelona, Spain\\
+\small\texttt{giulio.ruffini@neuroelectrics.com}}
+\date{Technical Note -- Draft, March 2026}
+
+\begin{document}
+\maketitle
+
+% ──────────────────────────────────────────────────────────
+\begin{abstract}
+Standard deep networks apply every layer uniformly to every input.
+We argue that \emph{depth should be dynamic and input-dependent},
+controlled by the compositional complexity of the data-generating process.
+Building on the Lie-pseudogroup framework of compositional symmetry
+\citep{Ruffini2025entropy,Ruffini2025compositional},
+we show that the hierarchical flag
+$G=H_0\supset H_1\supset\cdots\supset H_L$
+of a generative model naturally prescribes which layers
+an agent needs to engage for a given input:
+layers corresponding to inactive symmetry scales should be gated off.
+We formulate a \emph{symmetry-gated residual network} in which
+multiplicative gates have precise geometric meaning---they measure the
+presence of unresolved structure at each scale of the pseudogroup
+hierarchy.
+We then lay out a concrete experimental programme using
+Blender-generated datasets with known compositional structure
+to validate the theory.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════
+\section{Motivation: Why Dynamic Depth?}\label{sec:motivation}
+
+In a standard $L$-layer residual network the update rule is
+\begin{equation}\label{eq:resnet}
+  h_{\ell+1} = h_\ell + \Delta_\ell(h_\ell),
+  \qquad \ell = 0,1,\ldots,L-1,
+\end{equation}
+where $\Delta_\ell$ is the residual block at layer $\ell$.
+Every input traverses every layer with equal weight.
+Yet the compositional complexity of natural data varies enormously:
+a static scene with fixed illumination exercises far fewer
+generative degrees of freedom than an articulated body
+under changing viewpoint and lighting.
+
+Several lines of work address this mismatch:
+Adaptive Computation Time \citep{Graves2016},
+Universal Transformers \citep{Dehghani2019},
+Mixture-of-Depths \citep{Raposo2024},
+and LayerSkip \citep{Elhoushi2024}.
+All share the engineering goal of saving compute by skipping layers.
+What is missing is a \emph{principled theory that predicts
+when and why depth should be reduced}---one that connects
+the gate pattern to the structure of the data-generating process.
+
+This note proposes that the Lie-pseudogroup framework of
+compositional symmetry
+\citep{Ruffini2025entropy,Ruffini2025compositional}
+provides exactly such a theory.
+The central claim is:
+
+\medskip
+\noindent\fbox{\parbox{0.95\linewidth}{%
+\textbf{Thesis.}\quad
+The effective depth a network needs for a given input
+is determined by the number of active levels in the
+compositional factorisation of the data-generating symmetry group.
+Layers aligned with inactive symmetry scales carry near-zero residuals
+and should be gated off.
+Dynamic depth is not an architectural trick---it is a
+consequence of compositional structure in the world.}}
+\medskip
+
+% ══════════════════════════════════════════════════════════
+\section{Theoretical Framework}\label{sec:theory}
+
+We briefly recall the essential apparatus;
+full details are in \citet{Ruffini2025compositional}
+and \citet{Ruffini2025entropy}.
+
+\subsection{Lie-Pseudogroup Generative Models}
+
+\begin{definition}[Generative model]
+A generative model is a smooth map
+$f:\cC\to\R^X$ from an $M$-dimensional configuration manifold
+($M\ll X$) to observations.
+It is a \emph{Lie generative model} if a Lie pseudogroup $G$
+acts on $\cC$ and $\R^X$ such that
+$f(c) = f(\gamma\cdot c_0) = \gamma\cdot I_0$
+for $\gamma\in G$ and a reference observation $I_0$.
+\end{definition}
+
+Near the identity, elements of $G$ factor as
+\begin{equation}\label{eq:factor}
+  \gamma = \gamma^{(L)}\gamma^{(L-1)}\cdots\gamma^{(1)},
+  \qquad \gamma^{(k)}\in A_k,
+\end{equation}
+where each $A_k$ is a local sub-pseudogroup generated by
+``level-$k$'' infinitesimal symmetries.
+This is the formal expression of compositional nesting:
+complex deformations are built by composing a few primitive
+moves close to the identity.
+
+\subsection{The Symmetry Flag and Reduced Manifolds}
+
+Choosing the factorisation order in \eqref{eq:factor}
+induces a \emph{flag of sub-pseudogroups},
+\begin{equation}\label{eq:flag}
+  G = H_0 \supset H_1 \supset \cdots \supset H_L,
+  \qquad H_k := A_{k+1}\cdots A_L,
+\end{equation}
+obtained by successively omitting generators.
+Each step $H_{k-1}\to H_k$ declares a new set of symmetry
+directions ``already explained'' at coarser scale.
+The quotients $H_{k-1}/H_k \simeq A_k$ collect the
+\emph{residual directions} that remain to be explained at level~$k$.
+
+Passing to orbit spaces produces nested \emph{reduced manifolds}:
+\begin{equation}\label{eq:nested}
+  \cM_0 \supset \cM_1 := \cM_0/H_1 \supset \cdots
+  \supset \cM_L := \cM_{L-1}/H_L,
+  \qquad \dim\cM_{k+1} < \dim\cM_k.
+\end{equation}
+Motion within $\cM_k$ is driven only by
+residual generators in~$H_k$.
+
+\subsection{Dynamic Depth from the Flag}\label{sec:dynamic}
+
+Now consider an input stream $I_{\theta(t)}$ in which only
+generators at levels $1,\ldots,K$ are active
+(i.e.\ $\gamma^{(k)}\approx e$ for $k>K$).
+Then by construction:
+
+\begin{itemize}[nosep]
+\item The data lie on $\cM_K$, the reduced manifold obtained
+  by quotienting out the inactive levels.
+\item At any level $k>K$, the residual
+  $\varepsilon_k\in H_{k-1}/H_k$ is near the identity:
+  there is no unexplained structure at that scale.
+\item A world-tracking agent that mirrors this hierarchy
+  should produce near-zero updates at layers $k>K$.
+\end{itemize}
+
+This is the geometric origin of dynamic depth:
+\textbf{the effective depth equals the number of active
+compositional levels in the generative process.}
+
+% ══════════════════════════════════════════════════════════
+\section{Symmetry-Gated Residual Architecture}\label{sec:arch}
+
+We now translate the theory into a concrete neural architecture.
+
+\subsection{General Formulation}
+
+Replace the standard residual rule \eqref{eq:resnet} with
+\begin{equation}\label{eq:gated}
+  \boxed{
+  h_{\ell+1} = h_\ell
+    + \alpha_\ell(x,\, h_\ell)\;\Delta_\ell(h_\ell),
+  \qquad \alpha_\ell \in [0,1].
+  }
+\end{equation}
+When $\alpha_\ell\approx 0$ the layer is effectively skipped;
+when $\alpha_\ell\approx 1$ it contributes fully.
+This is a soft, differentiable version of dynamic depth.
+
+\paragraph{Geometric interpretation.}
+In the symmetry-theoretic picture, layer $\ell$ corresponds
+to level $k(\ell)$ of the flag.
+The gate $\alpha_\ell$ measures whether the input has
+unresolved structure in the quotient $H_{k-1}/H_k$:
+\begin{equation}
+  \alpha_\ell \;\approx\; \|\text{residual component in }
+  \Lie(A_{k(\ell)})\|.
+\end{equation}
+This is not a free scalar learned by gradient descent alone---it
+has a \emph{predicted} relationship to the compositional complexity
+of the input.
+
+\subsection{Gate Design Choices}
+
+\paragraph{Granularity.}
+The gate can operate at different granularities:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Granularity & Gate shape & Interpretation \\
+\midrule
+Per-sequence & $\alpha_\ell(x)\in\R$ & One depth profile per input \\
+Per-token & $\alpha_{\ell,t}(h_{\ell,t})\in\R$ & Token-wise depth \\
+Per-channel/head & $\alpha_{\ell,t,c}\in\R^{d}$ & Fine-grained routing \\
+\bottomrule
+\end{tabular}
+\end{center}
+For the Blender experiments (Section~\ref{sec:experiments}),
+per-sequence gating suffices because the generative hierarchy
+is a property of the scene, not of individual pixels.
+For language, per-token gating is more natural.
+
+\paragraph{Soft vs.\ hard gates.}
+Soft gates (sigmoid) are easy to train and allow fractional
+contribution. Hard gates (top-$k$, straight-through) save
+FLOPs but require tricks for gradient flow.
+We recommend starting with soft gates and adding a
+\emph{compute penalty} to encourage sparsity:
+\begin{equation}\label{eq:loss}
+  \cL = \cL_{\text{task}}
+  + \lambda\sum_{\ell=1}^{L}\alpha_\ell,
+\end{equation}
+where $\lambda>0$ controls the depth--accuracy trade-off.
+
+\paragraph{Budgeted variant.}
+For a fixed compute budget $C$, one can impose
+$\sum_\ell\alpha_\ell = C$
+using a softmax or Sinkhorn normalisation over layers.
+This is closer in spirit to Mixture-of-Depths.
+
+\subsection{Concrete Gate Module}\label{sec:gate-module}
+
+A minimal implementation:
+\begin{equation}\label{eq:gate-impl}
+  \alpha_\ell = \sigma\!\bigl(
+    w_\ell^\top \Pool(h_\ell) + b_\ell
+  \bigr),
+\end{equation}
+where $\Pool$ is global average pooling (for images) or
+\texttt{[CLS]} extraction (for transformers),
+$w_\ell\in\R^d$, $b_\ell\in\R$, and $\sigma$ is the sigmoid.
+This adds $d+1$ parameters per layer---negligible overhead.
+
+For token-wise gating:
+\begin{equation}
+  \alpha_{\ell,t} = \sigma(W_\ell\, h_{\ell,t} + b_\ell),
+  \qquad W_\ell\in\R^{1\times d}.
+\end{equation}
+
+\subsection{Relationship to Predictive Coding}
+
+The predictive hierarchy of \citet{Ruffini2025compositional}
+prescribes a richer per-layer algorithm than a simple gate:
+\begin{equation}\label{eq:predcoding}
+  \text{predict} \;\to\;
+  \text{compare} \;\to\;
+  \text{update locally via } P_k \;\to\;
+  \text{canonicalise} \;\to\;
+  \text{coarse-grain via } \mathcal{C}_{k\to k+1} \;\to\;
+  \text{pass up}.
+\end{equation}
+Here $P_k:\fg\to\fh_k$ is the orthogonal projector onto
+$\Lie(H_k)$, and $Q_k = I-P_k$ extracts the quotient directions.
+Each level absorbs what it can explain
+($P_k\eta_k$) and forwards only the unresolved remainder
+($Q_k\eta_k$) after canonicalisation and coarse-graining.
+
+The simple gate $\alpha_\ell$ in \eqref{eq:gated} is a
+\emph{scalar summary} of this richer process:
+$\alpha_\ell\approx \|Q_{k(\ell)}\eta_{k(\ell)}\|$.
+Building architectures that implement the full
+predict--compare--canonicalise--coarse-grain loop
+at each level is a natural next step
+(see Section~\ref{sec:future}).
+
+
+% ══════════════════════════════════════════════════════════
+\section{Experimental Programme}\label{sec:experiments}
+
+The key advantage of this framework is that we can
+\emph{predict} gate patterns from the known generative hierarchy,
+and then test those predictions empirically.
+This requires a dataset where the compositional structure
+is fully controlled.
+
+\subsection{The Blender Cat Rig as a Testbed}\label{sec:blender}
+
+Following Appendix~C of \citet{Ruffini2025compositional},
+we use a production-quality Blender rig
+(e.g.\ the cat from the \emph{Flow} project,
+or any rigged character) whose configuration space decomposes as
+\begin{equation}
+  \cC \;\simeq\;
+  \cC_{\text{camera}} \times
+  \cC_{\text{body}} \times
+  \cC_{\text{spine}} \times
+  \cC_{\text{limbs}} \times
+  \cC_{\text{face}} \times
+  \cC_{\text{fur}} \times
+  \cC_{\text{light}} \times
+  \cC_{\text{env}}.
+\end{equation}
+The eight levels correspond to sub-pseudogroups $A_1,\ldots,A_8$
+(Table~\ref{tab:levels}).
+
+\begin{table}[h]
+\centering
+\caption{Lie-pseudogroup hierarchy for the Blender cat rig.}\label{tab:levels}
+\smallskip
+\begin{tabular}{@{}clll@{}}
+\toprule
+Level $k$ & Generators $A_k$ & Blender construct & $\dim A_k$ \\
+\midrule
+1 & Camera $SE(3)$ + lens & \texttt{camera.matrix\_world}, focal length & 7 \\
+2 & Global body/root $SE(3)$ & \texttt{pose.bones["root"]} & 6 \\
+3 & Torso/spine chain (PoE) & Spine bones, FK/IK & $\sim$12 \\
+4 & Limbs/paws/tail (PoE) & Limb bones, IK solvers & $\sim$24 \\
+5 & Facial morphology & Shape keys (blendshapes) & $\sim$20 \\
+6 & Fur/appearance & Material nodes, groom PCs & $\sim$6 \\
+7 & Illumination & Light transforms, SH coeffs & $\sim$12 \\
+8 & Environment/camera jitter & World rotation, exposure & $\sim$4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Dataset Generation Pipeline}\label{sec:datagen}
+
+We propose generating the dataset entirely through
+Blender's Python API (\texttt{bpy}), which avoids
+any need to ``patch'' Blender and can be run headless
+on a compute cluster.
+
+\paragraph{Step 1: Acquire or build a rigged character.}
+Options in decreasing order of realism:
+\begin{enumerate}[nosep]
+\item Download a production-ready rigged cat
+  (e.g.\ from BlenderKit, Sketchfab, or TurboSquid---many
+  are free under CC licences).
+  Look for rigs with armature, shape keys, and
+  shader-based materials.
+\item Use the free ``Cat'' asset from the Blender demo files.
+\item Build a simpler parametric model (e.g.\ an articulated
+  stick figure) for a first proof-of-concept.
+\end{enumerate}
+
+\paragraph{Step 2: Python script for controlled variation.}
+A Blender Python script that:
+\begin{enumerate}[nosep]
+\item Defines the $A_k$ parameter ranges
+  (joint angle limits, shape-key ranges, material parameter
+  ranges, light position/colour ranges, camera orbit).
+\item For each sample, draws $\theta^{(k)}\sim\text{Uniform}(A_k)$
+  for the \emph{active} levels and holds inactive levels at
+  their default (rest) values.
+\item Writes pose bone transforms via
+  \texttt{pose.bones[name].rotation\_quaternion},
+  shape key values via \texttt{key\_blocks[name].value},
+  material parameters via node socket values,
+  light transforms via \texttt{light.matrix\_world},
+  and camera via \texttt{camera.matrix\_world}
+  and \texttt{camera.data.lens}.
+\item Renders to an image buffer using Cycles or Eevee
+  and saves the image together with a metadata JSON
+  recording all parameter values and
+  which levels were active.
+\end{enumerate}
+
+\paragraph{Step 3: Construct controlled datasets.}
+For each subset $S\subseteq\{1,\ldots,8\}$ of active levels,
+generate $N$ images with only those levels varying.
+The key conditions are:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Condition name & Active levels \\
+\midrule
+\textsc{Static} & $\emptyset$ (single image, repeated) \\
+\textsc{CameraOnly} & $\{1\}$ \\
+\textsc{CameraBody} & $\{1,2\}$ \\
+\textsc{CameraBodySpine} & $\{1,2,3\}$ \\
+\textsc{FullPose} & $\{1,2,3,4\}$ \\
+\textsc{PoseFace} & $\{1,2,3,4,5\}$ \\
+\textsc{AllGeometric} & $\{1,\ldots,5\}$ \\
+\textsc{AllPlusAppearance} & $\{1,\ldots,7\}$ \\
+\textsc{Everything} & $\{1,\ldots,8\}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Step 4: Run headless.}
+All rendering can be launched from the command line:
+\begin{verbatim}
+  blender --background scene.blend \
+          --python generate_dataset.py -- \
+          --condition CameraBody --n_samples 5000
+\end{verbatim}
+No GUI needed; this runs on any Linux node with a GPU.
+
+\subsection{Training Protocol}\label{sec:training}
+
+\paragraph{Architecture.}
+Take a standard ResNet-50 (or Vision Transformer)
+and insert a gate module \eqref{eq:gate-impl}
+at every residual block.
+Train on the \textsc{Everything} condition
+with the gated loss~\eqref{eq:loss}.
+
+\paragraph{Baselines.}
+\begin{enumerate}[nosep]
+\item \emph{Standard ResNet-50}: no gates (fixed depth).
+\item \emph{Random gates}: $\alpha_\ell$ sampled uniformly,
+  to control for the regularisation effect of the penalty.
+\item \emph{ACT-style halting}: a single halting probability
+  rather than per-layer gates.
+\end{enumerate}
+
+\subsection{Measurements and Predictions}\label{sec:predictions}
+
+The theory makes the following \textbf{testable predictions}:
+
+\begin{enumerate}
+\item \textbf{Gate--complexity alignment.}\quad
+  When the trained model is evaluated on the controlled conditions,
+  the gate vector $(\alpha_1,\ldots,\alpha_L)$ should exhibit a
+  clear transition: gates corresponding to layers
+  aligned with inactive levels should be significantly
+  smaller than those aligned with active levels.
+
+  \emph{Metric:} For each condition with $K$ active levels,
+  compute the mean gate activation for ``active'' vs.\
+  ``inactive'' layer groups.
+  The theory predicts a monotone relationship:
+  more active levels $\Rightarrow$ more layers engaged.
+
+\item \textbf{Depth--complexity curve.}\quad
+  Define the \emph{effective depth}
+  $D_{\text{eff}}(x) := \sum_\ell \alpha_\ell(x)$.
+  The theory predicts $D_{\text{eff}}$ increases with the
+  number of active generative levels:
+  \begin{equation}
+    D_{\text{eff}}(\textsc{CameraOnly})
+    < D_{\text{eff}}(\textsc{CameraBody})
+    < \cdots
+    < D_{\text{eff}}(\textsc{Everything}).
+  \end{equation}
+
+\item \textbf{Residual structure.}\quad
+  The residual norms $\|\Delta_\ell(h_\ell)\|$ at
+  gated-off layers should be small not merely because the gate
+  suppresses them, but because the \emph{pre-gate} residual
+  itself carries little energy at that scale.
+  This distinguishes our account from pure regularisation artifacts.
+
+\item \textbf{Generalisation to novel compositions.}\quad
+  Train on conditions up to \textsc{FullPose} ($K=4$),
+  then evaluate on \textsc{PoseFace} ($K=5$) without retraining.
+  The theory predicts that gate~5 (face) will
+  activate to accommodate the new level,
+  demonstrating compositional generalisation of the depth profile.
+\end{enumerate}
+
+
+% ══════════════════════════════════════════════════════════
+\section{Relationship to Prior Work}\label{sec:related}
+
+\paragraph{Adaptive Computation Time (ACT) \citep{Graves2016}.}
+ACT learns a scalar halting probability per step in a
+recurrent (shared-weight) architecture.
+Our framework differs in three ways:
+(i) layers are \emph{distinct} (different $A_k$ at each level),
+so dynamic depth means selecting which \emph{compositions of
+different functions} to apply;
+(ii) gates have geometric meaning tied to the symmetry hierarchy;
+(iii) the prediction of gate patterns is derived from the
+generative model, not learned from scratch.
+
+\paragraph{Mixture-of-Depths \citep{Raposo2024}.}
+MoD routes a subset of tokens through each layer via top-$k$
+selection. This is per-token, hard-gated depth allocation.
+Our soft per-layer gating is complementary;
+the budgeted variant of \eqref{eq:loss} with a softmax
+over layers converges to a similar mechanism.
+
+\paragraph{Neural ODEs \citep{Chen2018}.}
+Neural ODEs make depth continuous; adaptive step-size solvers
+implement a form of dynamic depth.
+Our gate magnitude $\alpha_\ell$ plays the role of a
+step size in a discretised ODE.
+The connection to ODE stability analysis
+(Lyapunov functions, ISS bounds) is made explicit in
+\citet{Ruffini2025compositional}, Equation~(5).
+
+\paragraph{Deep Equilibrium Models \citep{Bai2019}.}
+DEQs take dynamic depth to the limit of infinite (shared) layers
+and find a fixed point.
+Our framework suggests that the fixed-point view
+is appropriate when the compositional hierarchy is
+\emph{recursive} (shared block), but
+\emph{compositional} hierarchies with distinct levels
+require distinct layers---making gated residual networks
+the natural architecture.
+
+
+% ══════════════════════════════════════════════════════════
+\section{Future Directions}\label{sec:future}
+
+\begin{enumerate}
+\item \textbf{Full predictive-coding architecture.}\quad
+  Replace the scalar gate with the full
+  predict--compare--project--canonicalise--coarse-grain
+  loop of \eqref{eq:predcoding}.
+  Each layer would contain:
+  (a) a predictor $\hat{I}_k = \hat\gamma_k\cdot I_0$,
+  (b) a comparator computing $\delta I_k = I - \hat{I}_k$,
+  (c) a linear residual fit
+  $\eta_k \approx \sum_a \eta_k^a V_a^{(k)}$,
+  (d) a projection $P_k\eta_k$ (local update)
+  and $Q_k\eta_k$ (upward message),
+  (e) a coarse-graining operator $\mathcal{C}_{k\to k+1}$.
+  This is architecturally richer than a gated ResNet and
+  directly implements the pseudogroup hierarchy.
+
+\item \textbf{Symmetry discovery.}\quad
+  Rather than prescribing the flag,
+  learn the generators $\{T_k\}$ and the factorisation
+  from data using methods such as LieGG \citep{Moskalev2022}
+  or the approach of \citet{Hu2024}.
+  The learned flag would then \emph{predict} the gate pattern.
+
+\item \textbf{Language and transformers.}\quad
+  Syntactic/semantic compositionality in language provides
+  a natural (if less controlled) hierarchy.
+  Per-token gating in a transformer could reveal whether
+  depth allocation correlates with measures of
+  linguistic compositional complexity
+  (syntactic depth, number of variable bindings,
+  logical nesting).
+
+\item \textbf{Brain signals.}\quad
+  EEG/neural signals exhibit varying temporal complexity.
+  A dynamic-depth model for neural decoding where the model
+  allocates more compositional processing to complex signal
+  epochs would connect to both the neuroscience of
+  processing difficulty and to KT's account of
+  structured experience.
+\end{enumerate}
+
+
+% ══════════════════════════════════════════════════════════
+\section{Summary}
+
+The standard dynamic-depth literature (ACT, MoD, LayerSkip)
+approaches the problem from an engineering direction:
+save compute by skipping layers.
+We approach it from the opposite direction:
+the Lie-pseudogroup framework of compositional symmetry
+\emph{predicts} when and why depth should be dynamic.
+
+The experimental programme proposed here---using Blender rigs
+with fully controlled compositional structure---provides a
+direct test: train a gated-depth network, then verify that
+the learned gate pattern matches the symmetry-predicted
+depth profile.
+If it does, we have the first empirical demonstration that
+dynamic depth in neural networks reflects the compositional
+structure of the data-generating process.
+
+The contribution is not another gated-depth mechanism.
+It is a \emph{theory that explains when and why dynamic depth
+emerges}, grounded in the geometry of Lie pseudogroups,
+together with a concrete plan to test it.
+
+
+% ══════════════════════════════════════════════════════════
+\begin{thebibliography}{20}
+\bibitem[Bai et~al.(2019)]{Bai2019}
+S.~Bai, J.~Z. Kolter, and V.~Koltun.
+\newblock Deep equilibrium models.
+\newblock In \emph{NeurIPS}, 2019.
+
+\bibitem[Chen et~al.(2018)]{Chen2018}
+R.~T.~Q. Chen, Y.~Rubanova, J.~Bettencourt, and D.~Duvenaud.
+\newblock Neural ordinary differential equations.
+\newblock In \emph{NeurIPS}, 2018.
+
+\bibitem[Dehghani et~al.(2019)]{Dehghani2019}
+M.~Dehghani, S.~Gouws, O.~Vinyals, J.~Uszkoreit, and \L.~Kaiser.
+\newblock Universal transformers.
+\newblock In \emph{ICLR}, 2019.
+
+\bibitem[Elhoushi et~al.(2024)]{Elhoushi2024}
+M.~Elhoushi, A.~Shrivastava, D.~Liskovich, B.~Hosseini,
+  R.~Rabbat, and C.-J.~Hsieh.
+\newblock {LayerSkip}: Enabling early exit inference and
+  self-speculative decoding.
+\newblock \emph{arXiv:2404.16710}, 2024.
+
+\bibitem[Graves(2016)]{Graves2016}
+A.~Graves.
+\newblock Adaptive computation time for recurrent neural networks.
+\newblock \emph{arXiv:1603.08983}, 2016.
+
+\bibitem[Hu et~al.(2024)]{Hu2024}
+L.~Hu, Y.~Li, and Z.~Lin.
+\newblock Symmetry discovery for different data types.
+\newblock \emph{arXiv:2410.09841}, 2024.
+
+\bibitem[Moskalev et~al.(2022)]{Moskalev2022}
+A.~Moskalev, A.~Sepliarskaia, I.~Sosnovik, and A.~Smeulders.
+\newblock {LieGG}: Studying learned {L}ie group generators.
+\newblock \emph{arXiv}, 2022.
+
+\bibitem[Raposo et~al.(2024)]{Raposo2024}
+D.~Raposo, S.~Ritter, B.~Richards, T.~Lillicrap,
+  P.~Conway~Humphreys, and A.~Santoro.
+\newblock Mixture-of-depths: Dynamically allocating compute
+  in transformer-based language models.
+\newblock \emph{arXiv:2404.02258}, 2024.
+
+\bibitem[Ruffini(2025a)]{Ruffini2025compositional}
+G.~Ruffini.
+\newblock Compositional symmetry as compression:
+  {L}ie-pseudogroup structure in algorithmic agents.
+\newblock \emph{arXiv:2510.10586}, 2025.
+
+\bibitem[Ruffini et~al.(2025b)]{Ruffini2025entropy}
+G.~Ruffini, F.~Castaldo, and J.~Vohryzek.
+\newblock Structured dynamics in the algorithmic agent.
+\newblock \emph{Entropy}, 27(1):90, 2025.
+\newblock \doi{10.3390/e27010090}.
+
+\end{thebibliography}
+
+\end{document}

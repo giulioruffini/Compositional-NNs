@@ -34,47 +34,35 @@ Each "condition" activates a subset of levels. The prediction is: more active le
 
 ## Files
 
-All Python entry points live in `scripts/` (run commands from that directory). Job metadata is stored under `jobs/`:
-
 ```
-scripts/
-  compositional_cat.py    — Jointed-cat model + dataset generator
-  gated_resnet.py         — Symmetry-gated autoencoder architecture
-  train_and_evaluate.py   — Training, evaluation, and plotting
-  list_jobs.py            — List runs from jobs registry (--last N, --status)
-jobs/
-  jobs_registry.json      — Central log of all runs (created on first run)
-ARCHITECTURE.md           — Pipeline, data model, and four predictions
-dynamic_depth_TN.tex      — LaTeX source for the technical note (if present)
-dynamic_depth_TN.pdf      — Compiled technical note (if present)
+compositional_cat.py      — Jointed-cat model v1 (legacy)
+compositional_cat_v2.py   — Jointed-cat model v2: bigger cat, wider parameter ranges
+gated_resnet.py           — Symmetry-gated autoencoder v3:
+                              • 1×1 stem and downsampling (forces spatial processing
+                                through gated blocks)
+                              • Gate uses [AvgPool, StdPool] for complexity-aware gating
+                              • Complexity-scaled penalty (simpler inputs → stronger λ)
+train_and_evaluate.py     — Training, evaluation, and plotting v2:
+                              • Mixed-condition training (all 8 conditions, balanced)
+                              • Progressive gate penalty warmup
+                              • Passes per-sample complexity to loss
+dynamic_depth_TN.tex      — LaTeX source for the technical note
+dynamic_depth_TN.pdf      — Compiled technical note
 ```
 
-## Run online (Colab, Kaggle)
+## Architecture (v3)
 
-If your machine is limited, run the pipeline in the cloud with a free GPU:
+Three key design choices make the gates meaningful:
 
-- **Google Colab (recommended):**
-  - **If the repo is public:** Open [this link](https://colab.research.google.com/github/giulioruffini/Compositional-NNs/blob/main/scripts/run_on_colab.ipynb) to open the notebook in Colab.
-  - **If the repo is private (or the link returns 404):** Colab cannot open private repos from GitHub. Instead: **File → Upload notebook** in Colab and upload `scripts/run_on_colab.ipynb` from your local clone. In the first code cell, comment the default clone line and uncomment the one that uses `https://YOUR_GITHUB_TOKEN@github.com/...` (create a token at [github.com/settings/tokens](https://github.com/settings/tokens)).
-  - In Colab: **Runtime → Change runtime type → GPU** (T4), then run the cells. The notebook clones the repo, installs deps, and runs a quick test; you can run a full training and download the results.
+1. **Minimal non-gated capacity.** The stem is a 1×1 conv (channel projection only) and downsampling is AvgPool + 1×1 conv. All 3×3 spatial feature extraction lives inside gated residual blocks. This ensures that closing a gate removes actual processing power.
 
-- **Kaggle:** Create a new Notebook, then in the **right sidebar → Settings** turn **Accelerator** to **GPU** and **Internet** to **On**. Use **`--device cuda`**. Do **not** run `pip install torch` on Kaggle—it can replace the pre-installed GPU PyTorch with a CPU-only build. Only install packages Kaggle may be missing (e.g. `tqdm`). Example:
-  ```python
-  !git clone https://github.com/giulioruffini/Compositional-NNs.git
-  %cd Compositional-NNs
-  !pip install -q tqdm
-  !cd scripts && python train_and_evaluate.py --n_train 5000 --n_eval 500 --n_epochs 20 --img_size 128 --batch_size 64 --device cuda --num_workers 4 --output_dir ../results_kaggle
-  ```
-  Use **`--num_workers 4`** so the DataLoader prefetches batches in parallel; otherwise the GPU sits idle waiting for on-the-fly image generation.
-  To confirm the GPU is used, run `import torch; print(torch.cuda.is_available())` — it should print `True`. Free GPU (P100) about 30 h/week. If your repo is private, use a token in the URL: `!git clone https://YOUR_TOKEN@github.com/giulioruffini/Compositional-NNs.git`
+2. **Richer gate conditioning.** Each gate sees `[AvgPool(h), StdPool(h)]` — the spatial standard deviation is a direct proxy for geometric complexity. A static cat has low spatial variance; an articulated cat under camera rotation has high variance.
 
-- **Paid GPU (long runs):** [Lambda Labs](https://lambdalabs.com), [RunPod](https://runpod.io), or [Vast.ai](https://vast.ai) offer cheap per-hour GPU instances. Clone the repo, install dependencies, and run the same commands as locally with `--device cuda`.
+3. **Complexity-scaled penalty.** During mixed-condition training, each sample's gate penalty is scaled by `(max_levels - n_levels + 1) / max_levels`. Simpler inputs get a stronger push to close gates; complex inputs get more freedom. Combined with a progressive warmup (λ ramps from 0 to λ_max over the first N epochs), this lets the model learn good features before selectively pruning.
 
 ## Quickstart
 
 ### Setup
-
-From the repo root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -83,123 +71,106 @@ pip install torch torchvision pillow matplotlib numpy tqdm
 
 ### Generate a sample grid
 
-Run from `scripts/`; create the output directory first if it doesn’t exist:
-
 ```bash
-mkdir -p dataset
-cd scripts
-python compositional_cat.py --mode grid --img_size 128 --output_dir ../dataset
+python compositional_cat_v2.py --mode grid --img_size 128 --output_dir dataset
 ```
 
-This produces `dataset/sample_grid.png` — rows are conditions (Static through Everything), columns are random samples.
+This produces `dataset/sample_grid_v2.png` — rows are conditions (Static through Everything), columns are random samples.
 
 ### Run the full pipeline
 
-From `scripts/` (use `--device cpu` on machines without CUDA):
-
 ```bash
-cd scripts
 python train_and_evaluate.py \
-  --n_train 20000 \
-  --n_eval 1000 \
-  --n_epochs 50 \
+  --n_train_per_cond 2000 \
+  --n_eval 500 \
+  --n_epochs 60 \
+  --gate_warmup 15 \
   --img_size 128 \
   --batch_size 64 \
-  --base_channels 64 \
+  --base_channels 32 \
   --n_stages 4 \
-  --n_blocks 3 \
-  --latent_dim 128 \
+  --n_blocks 2 \
+  --latent_dim 64 \
   --gate_penalty 0.01 \
-  --lr 1e-3 \
   --device cuda \
-  --output_dir ../results
+  --output_dir results
 ```
 
 On macOS or without a GPU, use `--device cpu` (training will be slower).
 
-This trains a 12-layer gated autoencoder on the "Everything" condition, then evaluates gate patterns on all conditions separately. Outputs:
+This trains an 8-layer gated autoencoder on **all conditions simultaneously** (8 × 2000 = 16,000 images), then evaluates gate patterns on each condition. Outputs:
 
 - `results/gated_autoencoder.pt` — trained model
 - `results/gate_analysis.json` — per-condition gate statistics
+- `results/training_history.json` — epoch-level training metrics
 - `results/dynamic_depth_results.png` — the four prediction plots
+- `results/training_curves.png` — loss, D_eff, and λ schedule
 
-For many runs, job metadata is logged in `jobs/jobs_registry.json` and in each run’s `output_dir` as `job_manifest.json` (parameters, timings, status, summary). See [ARCHITECTURE.md](ARCHITECTURE.md) for the pipeline and design.
+## Run online (Colab, Kaggle)
 
-### Quick verification run (fewer samples, fewer epochs)
+If your machine is limited, run the pipeline in the cloud with a free GPU:
 
-To check the pipeline end-to-end without a long training run:
+- **Kaggle:** Create a new Notebook, then in the **right sidebar → Settings** turn **Accelerator** to **GPU** and **Internet** to **On**. Do **not** run `pip install torch` on Kaggle — it can replace the pre-installed GPU PyTorch with a CPU-only build. Example:
+  ```python
+  !git clone https://github.com/giulioruffini/Compositional-NNs.git
+  %cd Compositional-NNs
+  !pip install -q tqdm
+  !python train_and_evaluate.py \
+      --n_train_per_cond 2000 --n_eval 500 --n_epochs 60 \
+      --gate_warmup 15 --img_size 128 --batch_size 64 \
+      --base_channels 32 --latent_dim 64 --gate_penalty 0.01 \
+      --device cuda --output_dir results
+  ```
 
-```bash
-cd scripts
-python train_and_evaluate.py --n_train 2000 --n_eval 200 --n_epochs 3 --img_size 64 --batch_size 32 --base_channels 32 --n_stages 3 --n_blocks 2 --latent_dim 64 --gate_penalty 0.01 --device cpu --output_dir ../results_quick
-```
-
-### Overnight run (~8 h)
-
-To size a run for about 8 hours:
-
-1. **Calibrate** with the recommended preset (one epoch only) to get a suggested `n_epochs`:
-
-```bash
-cd scripts
-python train_and_evaluate.py --calibrate \
-  --n_train 12000 --n_eval 1000 --n_epochs 40 \
-  --img_size 128 --batch_size 64 \
-  --base_channels 64 --n_stages 4 --n_blocks 3 --latent_dim 128 \
-  --gate_penalty 0.01 --lr 1e-3 --device cpu \
-  --output_dir ../results_overnight_calibrate
-```
-
-The script prints e.g. `Suggested n_epochs for ~8 h run: 42`. Use that value in step 2.
-
-2. **Run the full training** with the suggested `n_epochs` (replace `42` with the printed value):
-
-```bash
-python train_and_evaluate.py \
-  --n_train 12000 --n_eval 1000 --n_epochs 42 \
-  --img_size 128 --batch_size 64 \
-  --base_channels 64 --n_stages 4 --n_blocks 3 --latent_dim 128 \
-  --gate_penalty 0.01 --lr 1e-3 --device cpu \
-  --output_dir ../results_overnight_8h
-```
-
-### List jobs
-
-To list recent runs and their status (from `scripts/`):
-
-```bash
-python list_jobs.py --registry ../jobs/jobs_registry.json --last 10
-python list_jobs.py --status success
-```
+- **Google Colab:** **Runtime → Change runtime type → GPU** (T4), then clone and run as above.
 
 ### Generate a dataset to disk
 
-From `scripts/`:
-
 ```bash
-python compositional_cat.py --mode generate --condition FullPose --n_samples 10000 --img_size 128 --output_dir ../dataset
-python compositional_cat.py --mode all --n_samples 5000 --output_dir ../dataset   # all conditions
+python compositional_cat_v2.py --mode generate --condition FullPose --n_samples 10000 --img_size 128
+python compositional_cat_v2.py --mode all --n_samples 5000   # all conditions
 ```
 
 ## Key parameters
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `--gate_penalty` | 0.01 | **Most important.** Too low → all gates stay open. Too high → reconstruction collapses. Sweep {0.005, 0.01, 0.02, 0.03}. |
+| `--gate_penalty` | 0.05 | Max gate penalty (ramped during warmup). Try {0.005, 0.01, 0.02, 0.05}. |
+| `--gate_warmup` | 10 | Epochs to ramp λ from 0 to max. Lets the model learn features first. |
 | `--gate_init_bias` | 2.0 | Gates start at σ(2.0) ≈ 0.88 (mostly open). Keep at 2.0. |
-| `--img_size` | 64 | Use 128 for real runs. At 32, pose changes are barely visible. |
+| `--n_train_per_cond` | 1000 | Samples per condition. Total training = 8 × this. Use ≥2000 for real runs. |
+| `--img_size` | 64 | Use 128 for real runs. Below 64, gated blocks may not be needed. |
 | `--n_stages` | 4 | Number of encoder stages (each doubles channels). |
 | `--n_blocks` | 2 | Residual blocks per stage. Total gated layers = n_stages × n_blocks. |
-| `--latent_dim` | 64 | Bottleneck dimension. Use 128 for img_size=128. |
+| `--latent_dim` | 64 | Bottleneck dimension. Use 64–128 for img_size=128. |
 
 ## What to look for
 
 The key output is `dynamic_depth_results.png` with four panels:
 
 1. **Gate heatmap** — should show a "staircase": more active levels → more layers engaged
-2. **D_eff vs complexity** — should be monotonically increasing
-3. **Per-layer profiles** — simple conditions should have gates near zero at deeper layers
+2. **D_eff vs complexity** — should be monotonically increasing (at least for geometric levels 0–5)
+3. **Per-layer profiles** — simple conditions should have lower gate values, especially in early layers
 4. **Reconstruction error** — more complex conditions are harder to reconstruct
+
+Note: appearance (level 6) and background (level 7) are global colour changes that don't require spatial convolution depth. They may not follow the monotonic trend of the geometric levels — this is actually consistent with the theory.
+
+## Changelog
+
+### v3 (current)
+- **Mixed-condition training** — model sees all complexity levels, not just "Everything"
+- **Minimal non-gated encoder** — 1×1 stem and downsamples; all 3×3 processing is gated
+- **AvgPool + StdPool gating** — spatial variance gives gates a complexity signal
+- **Complexity-scaled penalty** — simpler inputs get stronger gate pressure
+- **Progressive warmup** — λ ramps from 0 to max over first N epochs
+
+### v2
+- Bigger cat (WORLD_SCALE 0.55 vs 0.35), wider parameter ranges
+- Thicker limbs and body for more pixel coverage
+- Vectorised background rendering (10× faster)
+
+### v1
+- Initial implementation with single-condition training on "Everything"
 
 ## References
 

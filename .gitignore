@@ -24,3 +24,9 @@ build/
 *.log
 nohup.out
 .matplotlib/
+
+# Project outputs
+results/
+dataset*/
+*.pt
+jobs/
