@@ -34,13 +34,11 @@ from compositional_cat_v2 import (
 # ── Slider layout ──────────────────────────────────────────
 
 LEVEL_NAMES = {
-    1: "L1: Camera  SE(2)×R⁺",
-    2: "L2: Root Body  SE(2)",
-    3: "L3: Spine  SO(1)³",
-    4: "L4: Limbs  SO(1)⁸",
-    5: "L5: Head/Tail  SO(1)⁴",
-    6: "L6: Appearance  R⁶",
-    7: "L7: Background  R³",
+    1: "L1: Pose  SO(1)¹⁵",
+    2: "L2: Appearance  R⁶",
+    3: "L3: Placement  SE(2)",
+    4: "L4: Camera  SE(2)×R⁺",
+    5: "L5: Background  R³",
 }
 
 # Friendly names for parameters
@@ -128,19 +126,21 @@ def build_gui(img_size: int = 256, initial_condition: str = 'Static'):
         # Level header
         if level != prev_level:
             current_y -= 0.006
+            header_colors = {1: '#c44', 2: '#a85', 3: '#2a7', 4: '#47c', 5: '#666'}
             fig.text(slider_left - 0.09, current_y, LEVEL_NAMES[level],
                      fontsize=7, fontweight='bold',
-                     color=['#333', '#c44', '#2a7', '#47c', '#a5a', '#c84', '#888', '#666'][level],
+                     color=header_colors.get(level, '#333'),
                      verticalalignment='top')
             current_y -= 0.016
             prev_level = level
 
         ax_s = fig.add_axes([slider_left, current_y, slider_width, slider_height])
         label = PARAM_LABELS.get(pname, pname)
+        level_colors = {1: '#e88', 2: '#ca8', 3: '#8c8', 4: '#88c', 5: '#aaa'}
         s = Slider(ax_s, label, lo, hi,
                    valinit=cat.params[pname],
                    valstep=(hi - lo) / 200,
-                   color=['#ddd', '#e88', '#8c8', '#88c', '#c8c', '#ca8', '#aaa', '#999'][level])
+                   color=level_colors.get(level, '#ddd'))
         ax_s.tick_params(labelsize=5)
         for text in ax_s.texts:
             text.set_fontsize(6)

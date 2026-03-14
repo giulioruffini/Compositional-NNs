@@ -15,13 +15,11 @@ D_eff should increase with the number of active generative levels.
 
 No blur, no tricks — just the pure group-action hierarchy:
   Level 0: Identity (static)
-  Level 1: Camera (SE(2) + scale)
-  Level 2: Body rigid motion
-  Level 3: Spine deformation
-  Level 4: Limb joints
-  Level 5: Head + tail joints
-  Level 6: Appearance (color, stripes)
-  Level 7: Background
+  Level 1: Pose — spine, limbs, head, tail (SO(1)^15)
+  Level 2: Appearance — color, stripes, proportions (R^6)
+  Level 3: Placement — cat position & rotation (SE(2))
+  Level 4: Camera — zoom, pan, rotation (SE(2) × R+)
+  Level 5: Background — gradient, colour (R^3)
 
 Author: G. Ruffini / Technical Note companion code — v6
 """
@@ -352,8 +350,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     eval_conditions = [
-        'Static', 'CameraOnly', 'CameraBody', 'CameraBodySpine',
-        'FullPose', 'PoseHeadTail', 'PlusAppearance', 'Everything'
+        'Static', 'PoseOnly', 'PoseAppearance',
+        'PosAppPlace', 'PosAppPlaceCam', 'Everything'
     ]
 
     n_total_layers = args.n_stages * args.n_blocks

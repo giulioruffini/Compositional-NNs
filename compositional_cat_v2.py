@@ -5,16 +5,16 @@ Hierarchical generative model for 2D articulated cats.
 
 Each level of the hierarchy corresponds to a Lie (pseudo)group action
 on the image-generating process, forming a compositional flag:
-  G = H_0  ⊃  H_1  ⊃  ...  ⊃  H_7
+  G = H_0  ⊃  H_1  ⊃  ...  ⊃  H_5
+
+Generative story: "pose the cat, dress it up, place it, photograph it"
 
   Level 0 (Static)     : Identity — one fixed cat image
-  Level 1 (Camera)     : SE(2) × R+  — global rigid + scale
-  Level 2 (Root body)  : SE(2)       — cat placement in scene
-  Level 3 (Spine)      : SO(1)^3     — spine joint rotations
-  Level 4 (Limbs)      : SO(1)^8     — 4 legs × 2 joints each
-  Level 5 (Head/Tail)  : SO(1)^4     — head pan/tilt + 2 tail joints
-  Level 6 (Appearance) : R^6         — color, size, stripe parameters
-  Level 7 (Background) : R^3         — gradient direction/color/intensity
+  Level 1 (Pose)       : SO(1)^15    — spine, limbs, head, tail joints
+  Level 2 (Appearance) : R^6         — color, thickness, stripes, eyes
+  Level 3 (Placement)  : SE(2)       — cat position & rotation in scene
+  Level 4 (Camera)     : SE(2) × R+  — observer zoom, pan, rotation
+  Level 5 (Background) : R^3         — gradient direction/color/intensity
 
 v3 improvements:
   - Eyes: pupils are vertical slits relative to HEAD direction (not image)
@@ -69,12 +69,11 @@ def forward_kinematics(
 # ═══════════════════════════════════════════════════════════
 
 class JointedCat:
-    """2D articulated cat — v2 with bigger body and wider ranges."""
+    """2D articulated cat — v3 with improved proportions."""
 
-    # Bigger segments for more pixel coverage
     SPINE_LENGTHS = [0.30, 0.30, 0.25]
     LEG_LENGTHS = [0.25, 0.22]
-    HEAD_LENGTHS = [0.14, 0.18]
+    HEAD_LENGTHS = [0.20, 0.20]  # longer neck so head pan/tilt is visible
     TAIL_LENGTHS = [0.22, 0.18]
 
     def __init__(self):
@@ -82,34 +81,19 @@ class JointedCat:
         self.set_defaults()
 
     def set_defaults(self):
-        # Level 1: Camera
-        self.params['cam_angle'] = 0.0
-        self.params['cam_tx'] = 0.0
-        self.params['cam_ty'] = 0.0
-        self.params['cam_scale'] = 1.0
-
-        # Level 2: Root body
-        self.params['root_x'] = 0.0
-        self.params['root_y'] = 0.0
-        self.params['root_angle'] = 0.0
-
-        # Level 3: Spine
+        # Level 1: Pose — spine, limbs, head, tail (intrinsic articulation)
         self.params['spine_0'] = 0.0
         self.params['spine_1'] = 0.0
         self.params['spine_2'] = 0.0
-
-        # Level 4: Limbs
         for side in ['bl', 'br', 'fl', 'fr']:
             self.params[f'leg_{side}_upper'] = 0.0
             self.params[f'leg_{side}_lower'] = 0.0
-
-        # Level 5: Head & tail
         self.params['head_pan'] = 0.0
         self.params['head_tilt'] = 0.0
         self.params['tail_0'] = 0.0
         self.params['tail_1'] = 0.0
 
-        # Level 6: Appearance
+        # Level 2: Appearance — surface properties
         self.params['body_hue'] = 0.08
         self.params['body_sat'] = 0.6
         self.params['body_val'] = 0.7
@@ -117,7 +101,18 @@ class JointedCat:
         self.params['eye_size'] = 1.0
         self.params['stripe_intensity'] = 0.0
 
-        # Level 7: Background
+        # Level 3: Placement — cat position & rotation in scene (SE(2))
+        self.params['root_x'] = 0.0
+        self.params['root_y'] = 0.0
+        self.params['root_angle'] = 0.0
+
+        # Level 4: Camera — observation transform (SE(2) × R+)
+        self.params['cam_angle'] = 0.0
+        self.params['cam_tx'] = 0.0
+        self.params['cam_ty'] = 0.0
+        self.params['cam_scale'] = 1.0
+
+        # Level 5: Background — environment
         self.params['bg_angle'] = 0.0
         self.params['bg_colour_shift'] = 0.5
         self.params['bg_intensity'] = 0.85
@@ -443,43 +438,37 @@ class JointedCat:
 
 
 # ═══════════════════════════════════════════════════════════
-# Parameter ranges — v2: MUCH wider for geometric levels
+# Hierarchy: build the cat → place it → observe it
+#
+#   Level 1: POSE        — intrinsic articulation (spine + limbs + head/tail)
+#   Level 2: APPEARANCE  — surface properties (color, stripes, proportions)
+#   Level 3: PLACEMENT   — cat position & rotation in the scene (SE(2))
+#   Level 4: CAMERA      — observer transform: zoom, pan, rotation (SE(2)×R+)
+#   Level 5: BACKGROUND  — environment (gradient, colour, intensity)
+#
+# Generative story: "pose the cat, dress it up, put it somewhere,
+#                     point the camera, choose the backdrop"
 # ═══════════════════════════════════════════════════════════
 
 LEVEL_PARAMS = {
-    1: {  # Camera — affects EVERYTHING including background
-        'cam_angle':  (-0.4, 0.4),       # tightened to keep cat in frame
-        'cam_tx':     (-0.25, 0.25),     # tightened (was ±0.5)
-        'cam_ty':     (-0.25, 0.25),     # tightened (was ±0.5)
-        'cam_scale':  (0.7, 1.3),        # tightened (was 0.6–1.5)
+    1: {  # POSE — all joint angles (15 params)
+        'spine_0':       (-0.7, 0.7),
+        'spine_1':       (-0.6, 0.6),
+        'spine_2':       (-0.5, 0.5),
+        'leg_bl_upper':  (-1.0, 1.0),
+        'leg_bl_lower':  (-1.2, 0.2),
+        'leg_br_upper':  (-1.0, 1.0),
+        'leg_br_lower':  (-1.2, 0.2),
+        'leg_fl_upper':  (-1.0, 1.0),
+        'leg_fl_lower':  (-1.2, 0.2),
+        'leg_fr_upper':  (-1.0, 1.0),
+        'leg_fr_lower':  (-1.2, 0.2),
+        'head_pan':      (-0.8, 0.8),
+        'head_tilt':     (-0.7, 0.7),
+        'tail_0':        (-1.2, 1.2),
+        'tail_1':        (-1.0, 1.0),
     },
-    2: {  # Root body — moves cat within frame (NOT background)
-        'root_x':     (-0.4, 0.4),       # tightened (was ±0.7)
-        'root_y':     (-0.3, 0.3),       # tightened (was ±0.5)
-        'root_angle': (-0.8, 0.8),       # rotation is fine
-    },
-    3: {  # Spine — much bendier
-        'spine_0': (-0.7, 0.7),          # was ±0.4
-        'spine_1': (-0.6, 0.6),          # was ±0.3
-        'spine_2': (-0.5, 0.5),          # was ±0.3
-    },
-    4: {  # Limbs — full range of motion
-        'leg_bl_upper': (-1.0, 1.0),     # was ±0.6
-        'leg_bl_lower': (-1.2, 0.2),     # was -0.8..0.1
-        'leg_br_upper': (-1.0, 1.0),
-        'leg_br_lower': (-1.2, 0.2),
-        'leg_fl_upper': (-1.0, 1.0),
-        'leg_fl_lower': (-1.2, 0.2),
-        'leg_fr_upper': (-1.0, 1.0),
-        'leg_fr_lower': (-1.2, 0.2),
-    },
-    5: {  # Head & tail — exaggerated
-        'head_pan':  (-0.8, 0.8),        # was ±0.5
-        'head_tilt': (-0.7, 0.7),        # was ±0.4
-        'tail_0':    (-1.2, 1.2),        # was ±0.8
-        'tail_1':    (-1.0, 1.0),        # was ±0.6
-    },
-    6: {  # Appearance — same
+    2: {  # APPEARANCE — surface properties (6 params)
         'body_hue':         (0.0, 0.18),
         'body_sat':         (0.2, 1.0),
         'body_val':         (0.35, 0.95),
@@ -487,7 +476,18 @@ LEVEL_PARAMS = {
         'eye_size':         (0.5, 1.8),
         'stripe_intensity': (0.0, 1.0),
     },
-    7: {  # Background — same
+    3: {  # PLACEMENT — cat in scene: SE(2) (3 params)
+        'root_x':     (-0.4, 0.4),
+        'root_y':     (-0.3, 0.3),
+        'root_angle': (-0.8, 0.8),
+    },
+    4: {  # CAMERA — observation: SE(2)×R+ (4 params)
+        'cam_angle':  (-0.4, 0.4),
+        'cam_tx':     (-0.25, 0.25),
+        'cam_ty':     (-0.25, 0.25),
+        'cam_scale':  (0.7, 1.3),
+    },
+    5: {  # BACKGROUND — environment (3 params)
         'bg_angle':        (0.0, 2*np.pi),
         'bg_colour_shift': (0.0, 1.0),
         'bg_intensity':    (0.4, 1.0),
@@ -495,15 +495,12 @@ LEVEL_PARAMS = {
 }
 
 CONDITIONS = {
-    'Static':           [],
-    'CameraOnly':       [1],
-    'CameraBody':       [1, 2],
-    'CameraBodySpine':  [1, 2, 3],
-    'FullPose':         [1, 2, 3, 4],
-    'PoseHeadTail':     [1, 2, 3, 4, 5],
-    'AllGeometric':     [1, 2, 3, 4, 5],
-    'PlusAppearance':   [1, 2, 3, 4, 5, 6],
-    'Everything':       [1, 2, 3, 4, 5, 6, 7],
+    'Static':           [],           # L0: one fixed cat
+    'PoseOnly':         [1],          # L1: vary articulation
+    'PoseAppearance':   [1, 2],       # L1+2: + colour/stripes
+    'PosAppPlace':      [1, 2, 3],    # L1-3: + cat position/rotation
+    'PosAppPlaceCam':   [1, 2, 3, 4], # L1-4: + camera transform
+    'Everything':       [1, 2, 3, 4, 5],  # L1-5: + background
 }
 
 
