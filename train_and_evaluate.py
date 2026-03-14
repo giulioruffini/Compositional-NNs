@@ -1,5 +1,5 @@
 """
-Training and Evaluation for Compositional Dynamic Depth — v5
+Training and Evaluation for Compositional Dynamic Depth — v6
 =============================================================
 
 Key design: SEPARATE MODEL PER CONDITION.
@@ -23,7 +23,7 @@ No blur, no tricks — just the pure group-action hierarchy:
   Level 6: Appearance (color, stripes)
   Level 7: Background
 
-Author: G. Ruffini / Technical Note companion code — v5
+Author: G. Ruffini / Technical Note companion code — v6
 """
 
 import os
@@ -216,7 +216,7 @@ def plot_results(results: list, output_dir: str = 'results'):
     n_levels = [r['n_active_levels'] for r in results]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Compositional Dynamic Depth: Per-Condition Training (v5)',
+    fig.suptitle('Compositional Dynamic Depth: Per-Condition Training (v6)',
                  fontsize=14, fontweight='bold')
 
     # Gate heatmap
@@ -330,7 +330,7 @@ def main():
     parser.add_argument('--n_epochs', type=int, default=60)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--gate_penalty', type=float, default=0.002,
+    parser.add_argument('--gate_penalty', type=float, default=0.0005,
                        help='Gate penalty λ (same for all conditions)')
     parser.add_argument('--gate_warmup', type=int, default=15,
                        help='Epochs to ramp gate penalty from 0 to max')
@@ -367,7 +367,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
 
         print("=" * 60)
-        print(f"Compositional Dynamic Depth — Per-Condition Training (v5)")
+        print(f"Compositional Dynamic Depth — Per-Condition Training (v6)")
         print(f"Gate penalty λ = {penalty_val}")
         print("=" * 60)
         print(f"  Architecture: {args.n_stages} stages × {args.n_blocks} blocks = "
