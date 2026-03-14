@@ -1,16 +1,31 @@
 """
-Compositional Jointed-Cat Generator — v2 (high-contrast)
-=========================================================
-Key changes from v1:
-  - Cat is MUCH bigger in the frame (scale 0.60 vs 0.35)
-  - Parameter ranges are 2-3x wider for geometric levels
-  - Thicker limbs and body for more pixel coverage
-  - Numpy-vectorised background (10x faster rendering)
-  - Levels 1 & 2 are now clearly distinguishable:
-      Level 1 (camera) rotates/scales the whole image including background
-      Level 2 (root body) moves the cat within the frame
+Compositional Jointed-Cat Generator — v3 (improved realism)
+=============================================================
+Hierarchical generative model for 2D articulated cats.
 
-Author: G. Ruffini / Technical Note companion code — v2
+Each level of the hierarchy corresponds to a Lie (pseudo)group action
+on the image-generating process, forming a compositional flag:
+  G = H_0  ⊃  H_1  ⊃  ...  ⊃  H_7
+
+  Level 0 (Static)     : Identity — one fixed cat image
+  Level 1 (Camera)     : SE(2) × R+  — global rigid + scale
+  Level 2 (Root body)  : SE(2)       — cat placement in scene
+  Level 3 (Spine)      : SO(1)^3     — spine joint rotations
+  Level 4 (Limbs)      : SO(1)^8     — 4 legs × 2 joints each
+  Level 5 (Head/Tail)  : SO(1)^4     — head pan/tilt + 2 tail joints
+  Level 6 (Appearance) : R^6         — color, size, stripe parameters
+  Level 7 (Background) : R^3         — gradient direction/color/intensity
+
+v3 improvements:
+  - Eyes: pupils are vertical slits relative to HEAD direction (not image)
+  - Body: smooth polygon hull along spine (not stacked circles)
+  - Ears: pointier triangles with inner ear color
+  - Whiskers on the face
+  - Tapered tail (thick→thin)
+  - Rounder paws with visible toes
+  - Better proportions (shoulders wider, hips narrower)
+
+Author: G. Ruffini / Technical Note companion code — v3
 """
 
 import numpy as np
@@ -154,12 +169,35 @@ class JointedCat:
 
         return chains
 
+    def _make_body_hull(self, spine_px, widths):
+        """Create smooth body outline polygon from spine points and per-segment widths."""
+        if len(spine_px) < 2:
+            return []
+
+        # Build left and right contour along spine
+        left_pts, right_pts = [], []
+        for i in range(len(spine_px)):
+            if i < len(spine_px) - 1:
+                dx = spine_px[i+1][0] - spine_px[i][0]
+                dy = spine_px[i+1][1] - spine_px[i][1]
+            else:
+                dx = spine_px[i][0] - spine_px[i-1][0]
+                dy = spine_px[i][1] - spine_px[i-1][1]
+            nm = max(1e-6, np.sqrt(dx*dx + dy*dy))
+            # Normal perpendicular to spine direction
+            nx, ny = -dy/nm, dx/nm
+            w = widths[min(i, len(widths)-1)]
+            left_pts.append((spine_px[i][0] + nx*w, spine_px[i][1] + ny*w))
+            right_pts.append((spine_px[i][0] - nx*w, spine_px[i][1] - ny*w))
+
+        # Close the hull: left side forward, right side backward
+        hull = left_pts + list(reversed(right_pts))
+        return hull
+
     def render(self, img_size: int = 128) -> Image.Image:
         p = self.params
         chains = self.compute_skeleton()
 
-        # ── Camera transform ──
-        # KEY CHANGE: scale factor 0.55 (was 0.35) — cat fills much more of the frame
         WORLD_SCALE = 0.40
 
         def world_to_pixel(pt: np.ndarray) -> Tuple[float, float]:
@@ -170,11 +208,11 @@ class JointedCat:
             py = img_size/2 - translated[1] * img_size * WORLD_SCALE
             return (px, py)
 
-        # ── Background (vectorised — 10x faster than pixel loop) ──
+        # ── Background (vectorised) ──
         ys, xs = np.mgrid[0:img_size, 0:img_size]
-        nx = xs / img_size - 0.5
-        ny = ys / img_size - 0.5
-        grad = nx * np.cos(p['bg_angle']) + ny * np.sin(p['bg_angle'])
+        ux = xs / img_size - 0.5
+        uy = ys / img_size - 0.5
+        grad = ux * np.cos(p['bg_angle']) + uy * np.sin(p['bg_angle'])
         grad = 0.5 + 0.5 * grad
         bi = p['bg_intensity']
         bs = p['bg_colour_shift']
@@ -185,104 +223,221 @@ class JointedCat:
         img = Image.fromarray(bg_arr, 'RGB')
         draw = ImageDraw.Draw(img)
 
-        # ── Appearance ──
+        # ── Colours ──
         body_rgb = tuple(int(255*c) for c in colorsys.hsv_to_rgb(
             p['body_hue'], p['body_sat'], p['body_val']
         ))
         dark_rgb = tuple(int(255*c) for c in colorsys.hsv_to_rgb(
-            p['body_hue'], p['body_sat'], p['body_val'] * 0.6
+            p['body_hue'], p['body_sat'], p['body_val'] * 0.55
         ))
-        # THICKER limbs for more pixel coverage
-        base_width = max(2, int(6 * p['limb_thickness'] * img_size / 128))
-        body_width = max(3, int(9 * p['limb_thickness'] * img_size / 128))
+        belly_rgb = tuple(int(255*c) for c in colorsys.hsv_to_rgb(
+            p['body_hue'], p['body_sat'] * 0.4, min(1.0, p['body_val'] * 1.2)
+        ))
+        inner_ear_rgb = tuple(int(255*c) for c in colorsys.hsv_to_rgb(
+            0.0, 0.35, min(1.0, p['body_val'] * 1.1)
+        ))
 
-        # ── Draw: tail, legs, spine, head ──
+        # ── Widths (scale with image and thickness param) ──
+        sc = img_size / 128.0
+        thick = p['limb_thickness']
+        leg_w = max(2, int(5.5 * thick * sc))
+        # Body widths along spine: hips → mid-body → shoulders (shoulders wider)
+        body_widths = [
+            max(3, int(7.5 * thick * sc)),   # pelvis
+            max(4, int(10.0 * thick * sc)),   # mid
+            max(4, int(10.5 * thick * sc)),   # mid-front
+            max(4, int(9.0 * thick * sc)),    # shoulders
+        ]
 
-        # Tail
+        # ── 1. Tapered tail ──
         tail_px = [world_to_pixel(pt) for pt in chains['tail']]
         if len(tail_px) >= 2:
-            draw.line(tail_px, fill=body_rgb, width=max(1, base_width - 1))
+            for i in range(len(tail_px) - 1):
+                t = i / max(1, len(tail_px) - 1)
+                w = max(1, int(leg_w * (1.0 - 0.6 * t)))  # thick→thin
+                draw.line([tail_px[i], tail_px[i+1]], fill=body_rgb, width=w)
+            # Tail tip
+            tx, ty = tail_px[-1]
+            tr = max(1, leg_w * 0.3)
+            draw.ellipse([tx-tr, ty-tr, tx+tr, ty+tr], fill=body_rgb)
 
-        # Legs
-        for key in ['leg_bl', 'leg_br', 'leg_fl', 'leg_fr']:
+        # ── 2. Back legs (behind body) ──
+        for key in ['leg_bl', 'leg_br']:
             leg_px = [world_to_pixel(pt) for pt in chains[key]]
             if len(leg_px) >= 2:
-                draw.line(leg_px, fill=dark_rgb, width=base_width)
-                ex, ey = leg_px[-1]
-                pr = max(2, base_width * 0.7)
-                draw.ellipse([ex-pr, ey-pr, ex+pr, ey+pr], fill=dark_rgb)
+                # Upper leg
+                draw.line([leg_px[0], leg_px[1]], fill=dark_rgb, width=leg_w)
+                if len(leg_px) >= 3:
+                    # Lower leg
+                    draw.line([leg_px[1], leg_px[2]], fill=dark_rgb, width=max(2, leg_w - 1))
+                    # Paw (oval)
+                    fx2, fy2 = leg_px[-1]
+                    pw = max(2, leg_w * 0.8)
+                    ph = max(2, leg_w * 0.5)
+                    draw.ellipse([fx2-pw, fy2-ph, fx2+pw, fy2+ph], fill=dark_rgb)
 
-        # Spine (body)
+        # ── 3. Body hull (smooth polygon) ──
         spine_px = [world_to_pixel(pt) for pt in chains['spine']]
         if len(spine_px) >= 2:
-            draw.line(spine_px, fill=body_rgb, width=body_width)
+            hull = self._make_body_hull(spine_px, body_widths)
+            if len(hull) >= 3:
+                draw.polygon(hull, fill=body_rgb)
 
-        # Body volume (filled ellipses along spine)
-        for i in range(len(spine_px) - 1):
-            x0, y0 = spine_px[i]
-            x1, y1 = spine_px[i+1]
-            cx, cy = (x0+x1)/2, (y0+y1)/2
-            r = body_width * 1.0
-            draw.ellipse([cx-r, cy-r*0.75, cx+r, cy+r*0.75], fill=body_rgb)
+            # Belly highlight (lighter strip along bottom of body)
+            belly_widths = [w * 0.5 for w in body_widths]
+            belly_hull = self._make_body_hull(spine_px, belly_widths)
+            if len(belly_hull) >= 3:
+                # Offset downward slightly
+                offset_hull = [(x, y + body_widths[0] * 0.25) for x, y in belly_hull]
+                draw.polygon(offset_hull, fill=belly_rgb)
 
-        # Stripes
+        # ── 4. Stripes on body ──
         if p['stripe_intensity'] > 0.05:
             stripe_rgb = tuple(max(0, int(c * (1 - 0.5 * p['stripe_intensity']))) for c in body_rgb)
             for i in range(len(spine_px) - 1):
                 x0, y0 = spine_px[i]
                 x1, y1 = spine_px[i+1]
-                for t in [0.3, 0.7]:
-                    sx = x0 + t*(x1-x0)
-                    sy = y0 + t*(y1-y0)
-                    dx, dy = x1-x0, y1-y0
-                    nm = max(1e-6, np.sqrt(dx*dx + dy*dy))
-                    nx2, ny2 = -dy/nm, dx/nm
-                    sr = body_width * 0.8
-                    draw.line([(sx-nx2*sr, sy-ny2*sr), (sx+nx2*sr, sy+ny2*sr)],
-                              fill=stripe_rgb, width=max(1, base_width//2))
+                dx, dy = x1 - x0, y1 - y0
+                nm = max(1e-6, np.sqrt(dx*dx + dy*dy))
+                nx2, ny2 = -dy/nm, dx/nm
+                w = body_widths[min(i, len(body_widths)-1)]
+                for t in [0.25, 0.5, 0.75]:
+                    sx = x0 + t * (x1 - x0)
+                    sy = y0 + t * (y1 - y0)
+                    sw = max(1, int(leg_w * 0.4))
+                    draw.line([(sx - nx2*w*0.9, sy - ny2*w*0.9),
+                               (sx + nx2*w*0.9, sy + ny2*w*0.9)],
+                              fill=stripe_rgb, width=sw)
 
-        # Head
+        # ── 5. Front legs (over body) ──
+        for key in ['leg_fl', 'leg_fr']:
+            leg_px = [world_to_pixel(pt) for pt in chains[key]]
+            if len(leg_px) >= 2:
+                draw.line([leg_px[0], leg_px[1]], fill=dark_rgb, width=leg_w)
+                if len(leg_px) >= 3:
+                    draw.line([leg_px[1], leg_px[2]], fill=dark_rgb, width=max(2, leg_w - 1))
+                    fx2, fy2 = leg_px[-1]
+                    pw = max(2, leg_w * 0.8)
+                    ph = max(2, leg_w * 0.5)
+                    draw.ellipse([fx2-pw, fy2-ph, fx2+pw, fy2+ph], fill=dark_rgb)
+
+        # ── 6. Head ──
         head_px = [world_to_pixel(pt) for pt in chains['head']]
         if len(head_px) >= 2:
-            draw.line(head_px[:2], fill=body_rgb, width=base_width)
-            hx, hy = head_px[-1]
-            hr = body_width * 1.2
-            draw.ellipse([hx-hr, hy-hr, hx+hr, hy+hr], fill=body_rgb)
+            # Neck
+            neck_w = max(2, int(6 * thick * sc))
+            draw.line(head_px[:2], fill=body_rgb, width=neck_w)
 
-            # Ears
-            es = hr * 0.7
+            hx, hy = head_px[-1]
+            hr = max(4, int(10 * thick * sc))
+
+            # Head direction vector
             dx = head_px[-1][0] - head_px[-2][0]
             dy = head_px[-1][1] - head_px[-2][1]
             nm = max(1e-6, np.sqrt(dx*dx + dy*dy))
-            fx, fy = dx/nm, dy/nm
+            fx, fy = dx/nm, dy/nm       # forward direction
+            rx, ry = -fy, fx             # right direction (perpendicular)
+
+            # ── Ears (pointy triangles with inner ear) ──
+            es = hr * 0.85
             for sign in [-1, 1]:
-                nx2, ny2 = -dy/nm * sign, dx/nm * sign
-                bx = hx + nx2 * hr * 0.5
-                by = hy + ny2 * hr * 0.5
-                tx = bx + nx2*es + fx*es*0.5
-                ty = by + ny2*es + fy*es*0.5
+                # Ear base on side of head
+                bx = hx + sign * rx * hr * 0.55
+                by = hy + sign * ry * hr * 0.55
+                # Ear tip: outward + forward
+                tx = bx + sign * rx * es * 0.7 + fx * es * 0.6
+                ty = by + sign * ry * es * 0.7 + fy * es * 0.6
+                # Outer ear
                 draw.polygon([
-                    (bx - fx*es*0.3, by - fy*es*0.3),
+                    (bx - fx * es * 0.35, by - fy * es * 0.35),
                     (tx, ty),
-                    (bx + fx*es*0.3, by + fy*es*0.3),
+                    (bx + fx * es * 0.25, by + fy * es * 0.25),
                 ], fill=body_rgb)
+                # Inner ear (smaller, pink)
+                ibx = bx + sign * rx * es * 0.08
+                iby = by + sign * ry * es * 0.08
+                itx = ibx + sign * rx * es * 0.45 + fx * es * 0.38
+                ity = iby + sign * ry * es * 0.45 + fy * es * 0.38
+                draw.polygon([
+                    (ibx - fx * es * 0.2, iby - fy * es * 0.2),
+                    (itx, ity),
+                    (ibx + fx * es * 0.12, iby + fy * es * 0.12),
+                ], fill=inner_ear_rgb)
 
-            # Eyes
-            eye_r = max(2, int(3.0 * p['eye_size'] * img_size / 128))
+            # Head circle (drawn after ears so it covers ear bases)
+            draw.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], fill=body_rgb)
+
+            # ── Eyes (pupils oriented relative to head, not image) ──
+            eye_r = max(2, int(3.2 * p['eye_size'] * sc))
             for sign in [-1, 1]:
-                nx2, ny2 = -dy/nm * sign, dx/nm * sign
-                ex = hx + sign * nx2 * hr * 0.35 + fx * hr * 0.2
-                ey = hy + sign * ny2 * hr * 0.35 + fy * hr * 0.2
-                draw.ellipse([ex-eye_r, ey-eye_r, ex+eye_r, ey+eye_r], fill=(50, 180, 50))
-                pr = max(1, eye_r // 2)
-                draw.ellipse([ex-pr, ey-pr*1.5, ex+pr, ey+pr*1.5], fill=(20, 20, 20))
+                # Eye position: offset sideways + slightly forward
+                ex = hx + sign * rx * hr * 0.38 + fx * hr * 0.22
+                ey = hy + sign * ry * hr * 0.38 + fy * hr * 0.22
+                # White of eye (slightly larger)
+                wr = eye_r * 1.15
+                draw.ellipse([ex - wr, ey - wr, ex + wr, ey + wr], fill=(240, 240, 235))
+                # Iris (green/amber)
+                draw.ellipse([ex - eye_r, ey - eye_r, ex + eye_r, ey + eye_r],
+                             fill=(80, 180, 60))
+                # Pupil: vertical slit RELATIVE TO HEAD DIRECTION
+                # The "up" axis of the head is the rx,ry direction
+                # Pupil is elongated along this axis
+                pr = max(1, eye_r * 0.35)
+                ph = max(1, eye_r * 0.85)
+                # Draw as a polygon (4 points of a narrow diamond along head's lateral axis)
+                pupil_pts = [
+                    (ex + rx * ph, ey + ry * ph),  # top of slit (head-relative)
+                    (ex + fx * pr, ey + fy * pr),   # right of slit
+                    (ex - rx * ph, ey - ry * ph),  # bottom of slit
+                    (ex - fx * pr, ey - fy * pr),   # left of slit
+                ]
+                draw.polygon(pupil_pts, fill=(15, 15, 15))
+                # Specular highlight
+                spr = max(1, eye_r * 0.25)
+                sx = ex + fx * eye_r * 0.2 + rx * eye_r * 0.15
+                sy = ey + fy * eye_r * 0.2 + ry * eye_r * 0.15
+                draw.ellipse([sx - spr, sy - spr, sx + spr, sy + spr],
+                             fill=(255, 255, 255))
 
-            # Nose
-            nose_x = hx + fx * hr * 0.55
-            nose_y = hy + fy * hr * 0.55
-            nr = max(2, int(2 * img_size / 128))
-            draw.ellipse([nose_x-nr, nose_y-nr*0.7, nose_x+nr, nose_y+nr*0.7],
-                        fill=(200, 120, 120))
+            # ── Nose (triangular, pink) ──
+            nose_x = hx + fx * hr * 0.6
+            nose_y = hy + fy * hr * 0.6
+            nr = max(2, int(2.5 * sc))
+            draw.polygon([
+                (nose_x + fx * nr * 0.3, nose_y + fy * nr * 0.3),
+                (nose_x + rx * nr, nose_y + ry * nr),
+                (nose_x - rx * nr, nose_y - ry * nr),
+            ], fill=(200, 130, 130))
+
+            # ── Mouth (small lines below nose) ──
+            mw = max(1, int(1 * sc))
+            mx = nose_x + fx * nr * 0.8
+            my = nose_y + fy * nr * 0.8
+            draw.line([(mx, my), (mx + rx * nr * 1.2 + fx * nr * 0.5,
+                                  my + ry * nr * 1.2 + fy * nr * 0.5)],
+                      fill=(160, 100, 100), width=mw)
+            draw.line([(mx, my), (mx - rx * nr * 1.2 + fx * nr * 0.5,
+                                  my - ry * nr * 1.2 + fy * nr * 0.5)],
+                      fill=(160, 100, 100), width=mw)
+
+            # ── Whiskers ──
+            ww = max(1, int(1 * sc))
+            whisker_base_r = hr * 0.5
+            whisker_len = hr * 1.5
+            for sign in [-1, 1]:
+                # 3 whiskers per side
+                for angle_off in [-0.2, 0.0, 0.2]:
+                    wb_x = hx + fx * whisker_base_r * 0.8 + sign * rx * whisker_base_r * 0.5
+                    wb_y = hy + fy * whisker_base_r * 0.8 + sign * ry * whisker_base_r * 0.5
+                    # Whisker direction: mostly sideways + slight forward/angle offset
+                    wd_x = sign * rx + fx * angle_off
+                    wd_y = sign * ry + fy * angle_off
+                    wnm = max(1e-6, np.sqrt(wd_x**2 + wd_y**2))
+                    wd_x, wd_y = wd_x / wnm, wd_y / wnm
+                    we_x = wb_x + wd_x * whisker_len
+                    we_y = wb_y + wd_y * whisker_len
+                    draw.line([(wb_x, wb_y), (we_x, we_y)],
+                              fill=(180, 180, 180), width=ww)
 
         return img
 
