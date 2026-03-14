@@ -1,33 +1,26 @@
 """
-Symmetry-Gated ResNet — v5
+Symmetry-Gated ResNet — v6
 ===========================
 Fully convolutional autoencoder with binary multiplicative gates.
 
-Key insight: earlier versions had an FC bottleneck (encoder FC → latent vector
-→ decoder FC → spatial map). The decoder FC could decode rich spatial maps
-from a flat (non-spatial) code, circumventing the gates entirely.
+KEY CHANGE from v5: the OFF-state fallback is now a LEARNED CONSTANT
+instead of the spatial mean μ(h). The spatial mean was input-dependent
+(different images → different channel averages), so information flowed
+through even with all gates OFF — making gates useless.
 
-v5 fix: FULLY CONVOLUTIONAL — no FC layers. The latent is a spatial feature
-map (B, C_latent, S, S). When gates destroy spatial info → encoder outputs
-constant maps → decoder (bilinear + 1×1 only) CANNOT recreate spatial detail.
-The model MUST keep gates open to preserve spatial features.
+v6 fix: when gate is OFF, the block outputs a LEARNED CONSTANT that
+does NOT depend on the input. This truly destroys information flow.
+The only way to produce input-dependent output is to have gates ON.
 
-Binary gates via Gumbel-Softmax force discrete ON/OFF decisions.
-Gate penalty acts as a "cost per layer" budget.
-Complex images need more layers → higher D_eff.
+  Gate ON:  h' = ReLU(h + Δ(h))  — full residual, input-dependent
+  Gate OFF: h' = ReLU(c)          — learned constant, same for ALL inputs
 
-Architecture:
-  Encoder:  1×1 stem → [gated 3×3 blocks + AvgPool+1×1 downsample]×N → 1×1 to latent
-  Latent:   (B, latent_channels, S, S) — spatial feature map, not vector
-  Decoder:  1×1 from latent → [bilinear ×2 + 1×1]×N → 1×1 to RGB
+Consequence for per-condition training:
+  - Static (one image): model memorizes via constants → D_eff ≈ 0
+  - Camera/Pose (varied images): constants can only predict mean → open gates
+  - Everything (max variation): needs most gates → D_eff highest
 
-Gate:
-  logit_ℓ = MLP([AvgPool(h_ℓ), StdPool(h_ℓ)])
-  α_ℓ ∈ {0, 1} via Gumbel-Softmax
-  ON:  h' = h + Δ(h)    — full residual with spatial features
-  OFF: h' = μ(h)         — only channel means, spatial info destroyed
-
-Author: G. Ruffini / Technical Note companion code — v5
+Author: G. Ruffini / Technical Note companion code — v6
 """
 
 import torch
@@ -106,10 +99,17 @@ class LayerGate(nn.Module):
 
 class GatedResBlock(nn.Module):
     """
-    Binary multiplicative gating.
+    Binary multiplicative gating with LEARNED CONSTANT bypass.
 
-    ON  (α=1):  h' = ReLU(h + Δ(h))     — full residual block
-    OFF (α=0):  h' = ReLU(μ(h))          — spatial info destroyed
+    ON  (α=1):  h' = ReLU(h + Δ(h))     — full residual, input-dependent
+    OFF (α=0):  h' = ReLU(c)             — learned constant, NO input info
+
+    The bypass constant c is a learnable parameter with shape (1, C, 1, 1),
+    broadcast to match the spatial dimensions. When gate is OFF, the output
+    is the SAME regardless of input — information flow is truly destroyed.
+
+    Gradients flow to bypass via straight-through Gumbel-Softmax even when
+    the hard gate is ON, so bypass is trained throughout.
     """
     def __init__(self, channels: int, gate_init_bias: float = 0.0, gate_tau: float = 1.0):
         super().__init__()
@@ -118,7 +118,9 @@ class GatedResBlock(nn.Module):
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
         self.gate = LayerGate(channels, init_bias=gate_init_bias, tau=gate_tau)
-        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+
+        # Learned constant bypass — does NOT depend on input
+        self.bypass = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = F.relu(self.bn1(self.conv1(x)))
@@ -127,9 +129,9 @@ class GatedResBlock(nn.Module):
         gate_binary, gate_prob = self.gate(x)
 
         h_full = x + residual
-        h_mean = self.spatial_pool(x).expand_as(x)
+        h_bypass = self.bypass.expand(x.size(0), -1, x.size(2), x.size(3))
 
-        out = gate_binary * h_full + (1.0 - gate_binary) * h_mean
+        out = gate_binary * h_full + (1.0 - gate_binary) * h_bypass
         out = F.relu(out)
 
         return out, gate_prob
