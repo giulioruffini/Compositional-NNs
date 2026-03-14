@@ -1,5 +1,5 @@
 """
-Compositional Jointed-Cat Generator — v3 (improved realism)
+Compositional Jointed-Cat Generator — v6 (enhanced realism)
 =============================================================
 Hierarchical generative model for 2D articulated cats.
 
@@ -10,22 +10,22 @@ on the image-generating process, forming a compositional flag:
 Generative story: "pose the cat, dress it up, place it, photograph it"
 
   Level 0 (Static)     : Identity — one fixed cat image
-  Level 1 (Pose)       : SO(1)^15    — spine, limbs, head, tail joints
+  Level 1 (Pose)       : SO(1)^16    — spine, limbs, head (pan/tilt/roll), tail
   Level 2 (Appearance) : R^6         — color, thickness, stripes, eyes
-  Level 3 (Placement)  : SE(2)       — cat position & rotation in scene
+  Level 3 (Placement)  : R^2 × SO(3) — position + full 3D rotation (5 params)
   Level 4 (Camera)     : SE(2) × R+  — observer zoom, pan, rotation
-  Level 5 (Background) : R^3         — gradient direction/color/intensity
+  Level 5 (Background) : R^1         — uniform greyscale intensity
 
-v3 improvements:
-  - Eyes: pupils are vertical slits relative to HEAD direction (not image)
-  - Body: smooth polygon hull along spine (not stacked circles)
-  - Ears: pointier triangles with inner ear color
-  - Whiskers on the face
-  - Tapered tail (thick→thin)
-  - Rounder paws with visible toes
-  - Better proportions (shoulders wider, hips narrower)
+v6 improvements (over v5):
+  - 2× supersampling anti-aliasing (render at 2× then LANCZOS downsample)
+  - Drop shadow under paws (grounding the cat in the scene)
+  - Thin body outline for definition against similar backgrounds
+  - Smooth Bézier-interpolated tail (cubic spline through FK joints)
+  - Paw toe details (small dark lines)
+  - Depth-ordered limb rendering (near/far legs from root_angle)
+  - 3D sphere-projected eyes with per-eye visibility and foreshortening
 
-Author: G. Ruffini / Technical Note companion code — v3
+Author: G. Ruffini / Technical Note companion code — v6
 """
 
 import numpy as np
@@ -68,8 +68,38 @@ def forward_kinematics(
 # Jointed Cat — v2
 # ═══════════════════════════════════════════════════════════
 
+def _cubic_interpolate(points, n_interp=12):
+    """Cubic spline interpolation through a list of 2D points.
+
+    Returns a denser list of (x, y) tuples for smooth curves.
+    Falls back to linear if scipy unavailable or < 3 points.
+    """
+    if len(points) < 3:
+        return points
+    try:
+        from scipy.interpolate import CubicSpline
+        pts = np.array(points)
+        t = np.linspace(0, 1, len(pts))
+        t_fine = np.linspace(0, 1, n_interp)
+        cs_x = CubicSpline(t, pts[:, 0])
+        cs_y = CubicSpline(t, pts[:, 1])
+        return [(float(cs_x(ti)), float(cs_y(ti))) for ti in t_fine]
+    except ImportError:
+        # Fallback: linear interpolation with more points
+        result = []
+        for i in range(len(points) - 1):
+            x0, y0 = points[i]
+            x1, y1 = points[i + 1]
+            steps = max(2, n_interp // (len(points) - 1))
+            for j in range(steps):
+                frac = j / steps
+                result.append((x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)))
+        result.append(points[-1])
+        return result
+
+
 class JointedCat:
-    """2D articulated cat — v3 with improved proportions."""
+    """2D articulated cat — v6 with anti-aliasing, shadows, outlines."""
 
     SPINE_LENGTHS = [0.30, 0.30, 0.25]
     LEG_LENGTHS = [0.25, 0.22]
@@ -90,6 +120,7 @@ class JointedCat:
             self.params[f'leg_{side}_lower'] = 0.0
         self.params['head_pan'] = 0.0
         self.params['head_tilt'] = 0.0
+        self.params['head_roll'] = 0.0   # tilts face around neck axis
         self.params['tail_0'] = 0.0
         self.params['tail_1'] = 0.0
 
@@ -101,10 +132,12 @@ class JointedCat:
         self.params['eye_size'] = 1.0
         self.params['stripe_intensity'] = 0.0
 
-        # Level 3: Placement — cat position & rotation in scene (SE(2))
+        # Level 3: Placement — position + SO(3) rotation
         self.params['root_x'] = 0.0
         self.params['root_y'] = 0.0
-        self.params['root_angle'] = 0.0
+        self.params['root_angle'] = 0.0       # yaw (in-plane)
+        self.params['root_elevation'] = 0.0   # pitch (view from above/below)
+        self.params['root_roll'] = 0.0        # roll (cat tilts sideways)
 
         # Level 4: Camera — observation transform (SE(2) × R+)
         self.params['cam_angle'] = 0.0
@@ -112,10 +145,8 @@ class JointedCat:
         self.params['cam_ty'] = 0.0
         self.params['cam_scale'] = 1.0
 
-        # Level 5: Background — environment
-        self.params['bg_angle'] = 0.0
-        self.params['bg_colour_shift'] = 0.5
-        self.params['bg_intensity'] = 0.85
+        # Level 5: Background — uniform greyscale
+        self.params['bg_grey'] = 0.75
 
     def compute_skeleton(self) -> Dict[str, List[np.ndarray]]:
         p = self.params
@@ -189,32 +220,70 @@ class JointedCat:
         hull = left_pts + list(reversed(right_pts))
         return hull
 
-    def render(self, img_size: int = 128) -> Image.Image:
+    @staticmethod
+    def _oriented_ellipse_pts(cx, cy, ux, uy, a, b, n_pts=24):
+        """Return polygon points for an ellipse with oriented axes.
+
+        (ux, uy) = unit vector for the semi-axis of length `a`.
+        Perpendicular direction gets semi-axis length `b`.
+        """
+        vx, vy = -uy, ux  # perpendicular
+        pts = []
+        for i in range(n_pts):
+            t = 2 * np.pi * i / n_pts
+            ct, st = np.cos(t), np.sin(t)
+            px = cx + a * ct * ux + b * st * vx
+            py = cy + a * ct * uy + b * st * vy
+            pts.append((px, py))
+        return pts
+
+    def render(self, img_size: int = 128, _aa_scale: int = 2) -> Image.Image:
+        """Render the cat. Uses 2× supersampling AA by default."""
+        if _aa_scale > 1:
+            hi_res = self._render_internal(img_size * _aa_scale)
+            return hi_res.resize((img_size, img_size), Image.LANCZOS)
+        return self._render_internal(img_size)
+
+    def _render_internal(self, img_size: int) -> Image.Image:
         p = self.params
         chains = self.compute_skeleton()
 
         WORLD_SCALE = 0.40
 
+        # ── Pseudo-3D rotation (SO(3) foreshortening) ──
+        # Embed 2D skeleton in 3D, apply elevation + roll rotations
+        # around the root position, then orthographic-project back to 2D.
+        root_2d = np.array([p['root_x'], p['root_y']])
+        elev = p.get('root_elevation', 0.0)
+        roll = p.get('root_roll', 0.0)
+        cos_e, sin_e = np.cos(elev), np.sin(elev)
+        cos_r, sin_r = np.cos(roll), np.sin(roll)
+        # Foreshortening scale for rendered sizes (geometric mean)
+        foreshorten = np.sqrt(abs(cos_e * cos_r))
+
         def world_to_pixel(pt: np.ndarray) -> Tuple[float, float]:
-            scaled = p['cam_scale'] * pt
+            # 1. Translate to root-relative coords
+            rel = pt - root_2d
+            x, y = rel[0], rel[1]
+            # 2. Embed in 3D: (x, y, 0)
+            # 3. Apply Rx(elev): (x, y*cos_e, y*sin_e)
+            # 4. Apply Ry(roll): (x*cos_r + y*sin_e*sin_r, y*cos_e, ...)
+            # 5. Orthographic project: take (x', y')
+            x2 = x * cos_r + y * sin_e * sin_r   # cross-term is key
+            y2 = y * cos_e
+            # Translate back
+            world_pt = root_2d + np.array([x2, y2])
+            # Camera transform
+            scaled = p['cam_scale'] * world_pt
             rotated = rot2d(p['cam_angle']) @ scaled
             translated = rotated + np.array([p['cam_tx'], p['cam_ty']])
             px = img_size/2 + translated[0] * img_size * WORLD_SCALE
             py = img_size/2 - translated[1] * img_size * WORLD_SCALE
             return (px, py)
 
-        # ── Background (vectorised) ──
-        ys, xs = np.mgrid[0:img_size, 0:img_size]
-        ux = xs / img_size - 0.5
-        uy = ys / img_size - 0.5
-        grad = ux * np.cos(p['bg_angle']) + uy * np.sin(p['bg_angle'])
-        grad = 0.5 + 0.5 * grad
-        bi = p['bg_intensity']
-        bs = p['bg_colour_shift']
-        r_ch = (255 * bi * (0.6 + 0.4 * bs * grad)).clip(0, 255).astype(np.uint8)
-        g_ch = (255 * bi * (0.7 + 0.3 * (1 - bs) * grad)).clip(0, 255).astype(np.uint8)
-        b_ch = (255 * bi * (0.75 + 0.25 * bs * (1 - grad))).clip(0, 255).astype(np.uint8)
-        bg_arr = np.stack([r_ch, g_ch, b_ch], axis=-1)
+        # ── Background (uniform greyscale) ──
+        grey_val = int(np.clip(p['bg_grey'] * 255, 0, 255))
+        bg_arr = np.full((img_size, img_size, 3), grey_val, dtype=np.uint8)
         img = Image.fromarray(bg_arr, 'RGB')
         draw = ImageDraw.Draw(img)
 
@@ -231,58 +300,127 @@ class JointedCat:
         inner_ear_rgb = tuple(int(255*c) for c in colorsys.hsv_to_rgb(
             0.0, 0.35, min(1.0, p['body_val'] * 1.1)
         ))
+        # Outline colour: slightly darker than body
+        outline_rgb = tuple(max(0, int(c * 0.45)) for c in body_rgb)
+        # Shadow colour: semi-transparent dark
+        shadow_rgb = tuple(max(0, int(grey_val * 0.55)) for _ in range(3))
 
-        # ── Widths (scale with image and thickness param) ──
+        # ── Widths (scale with image, thickness, and foreshortening) ──
         sc = img_size / 128.0
         thick = p['limb_thickness']
-        leg_w = max(2, int(5.5 * thick * sc))
+        fs = foreshorten  # sizes shrink with 3D rotation
+        leg_w = max(2, int(5.5 * thick * sc * fs))
         # Body widths along spine: hips → mid-body → shoulders (shoulders wider)
         body_widths = [
-            max(3, int(7.5 * thick * sc)),   # pelvis
-            max(4, int(10.0 * thick * sc)),   # mid
-            max(4, int(10.5 * thick * sc)),   # mid-front
-            max(4, int(9.0 * thick * sc)),    # shoulders
+            max(3, int(7.5 * thick * sc * fs)),   # pelvis
+            max(4, int(10.0 * thick * sc * fs)),   # mid
+            max(4, int(10.5 * thick * sc * fs)),   # mid-front
+            max(4, int(9.0 * thick * sc * fs)),    # shoulders
         ]
 
-        # ── 1. Tapered tail ──
+        # ── 0. Drop shadow ──
+        # Collect all paw (foot) positions and draw an elliptical shadow
+        paw_positions = []
+        for key in ['leg_bl', 'leg_br', 'leg_fl', 'leg_fr']:
+            if key in chains and len(chains[key]) >= 3:
+                paw_positions.append(world_to_pixel(chains[key][-1]))
+        if paw_positions:
+            paw_xs = [pp[0] for pp in paw_positions]
+            paw_ys = [pp[1] for pp in paw_positions]
+            # Shadow center: mean of paw x, bottom of paw y (+ offset)
+            scx = sum(paw_xs) / len(paw_xs)
+            scy = max(paw_ys) + leg_w * 0.4
+            # Shadow width spans paws, height is thin
+            sw = (max(paw_xs) - min(paw_xs)) * 0.45 + leg_w * 2.5
+            sh = max(2, leg_w * 0.7)
+            shadow_pts = self._oriented_ellipse_pts(scx, scy, 1, 0, sw, sh, n_pts=24)
+            draw.polygon(shadow_pts, fill=shadow_rgb)
+
+        # ── 1. Tapered tail (smooth Bézier curve) ──
         tail_px = [world_to_pixel(pt) for pt in chains['tail']]
         if len(tail_px) >= 2:
-            for i in range(len(tail_px) - 1):
-                t = i / max(1, len(tail_px) - 1)
-                w = max(1, int(leg_w * (1.0 - 0.6 * t)))  # thick→thin
-                draw.line([tail_px[i], tail_px[i+1]], fill=body_rgb, width=w)
-            # Tail tip
-            tx, ty = tail_px[-1]
-            tr = max(1, leg_w * 0.3)
+            # Interpolate through FK joints for a smooth curve
+            smooth_tail = _cubic_interpolate(tail_px, n_interp=16)
+            for i in range(len(smooth_tail) - 1):
+                t = i / max(1, len(smooth_tail) - 1)
+                w = max(1, int(leg_w * (1.0 - 0.7 * t)))  # thick→thin
+                draw.line([smooth_tail[i], smooth_tail[i+1]], fill=body_rgb, width=w)
+            # Tail tip (round cap)
+            tx, ty = smooth_tail[-1]
+            tr = max(1, leg_w * 0.25)
             draw.ellipse([tx-tr, ty-tr, tx+tr, ty+tr], fill=body_rgb)
 
-        # ── 2. Back legs (behind body) ──
-        for key in ['leg_bl', 'leg_br']:
-            leg_px = [world_to_pixel(pt) for pt in chains[key]]
-            if len(leg_px) >= 2:
-                # Upper leg
-                draw.line([leg_px[0], leg_px[1]], fill=dark_rgb, width=leg_w)
-                if len(leg_px) >= 3:
-                    # Lower leg
-                    draw.line([leg_px[1], leg_px[2]], fill=dark_rgb, width=max(2, leg_w - 1))
-                    # Paw (oval)
-                    fx2, fy2 = leg_px[-1]
-                    pw = max(2, leg_w * 0.8)
-                    ph = max(2, leg_w * 0.5)
-                    draw.ellipse([fx2-pw, fy2-ph, fx2+pw, fy2+ph], fill=dark_rgb)
+        # ── Depth-ordered limb rendering ──
+        # Determine which side is "far" (behind body) vs "near" (in front)
+        # based on root_angle: when facing right (angle≈0), 'l' legs are far
+        # Compute the perpendicular direction to root_angle
+        root_angle = p['root_angle']
+        # Perpendicular dot product: positive → 'l' legs are far side
+        facing_sign = np.sin(root_angle + sum([p['spine_0'], p['spine_1'], p['spine_2']]) * 0.5)
+        if facing_sign >= 0:
+            far_legs = ['leg_bl', 'leg_br', 'leg_fl', 'leg_fr']
+            near_legs = ['leg_br', 'leg_bl', 'leg_fr', 'leg_fl']
+        else:
+            far_legs = ['leg_br', 'leg_bl', 'leg_fr', 'leg_fl']
+            near_legs = ['leg_bl', 'leg_br', 'leg_fl', 'leg_fr']
+        # Far back/front legs drawn first, then body, then near legs
+        back_far = [k for k in far_legs if k.startswith('leg_b')][:1]
+        front_far = [k for k in far_legs if k.startswith('leg_f')][:1]
+        back_near = [k for k in near_legs if k.startswith('leg_b')][:1]
+        front_near = [k for k in near_legs if k.startswith('leg_f')][:1]
 
-        # ── 3. Body hull (smooth polygon) ──
+        def _draw_leg(key, color):
+            leg_px = [world_to_pixel(pt) for pt in chains[key]]
+            if len(leg_px) < 2:
+                return
+            # Upper leg
+            draw.line([leg_px[0], leg_px[1]], fill=color, width=leg_w)
+            if len(leg_px) >= 3:
+                # Lower leg (slightly thinner)
+                draw.line([leg_px[1], leg_px[2]], fill=color, width=max(2, leg_w - 1))
+                # Knee joint circle
+                kx, ky = leg_px[1]
+                kr = max(1, leg_w * 0.45)
+                draw.ellipse([kx-kr, ky-kr, kx+kr, ky+kr], fill=color)
+                # Paw (oval)
+                pawx, pawy = leg_px[-1]
+                pw = max(2, leg_w * 0.8)
+                ph_paw = max(2, leg_w * 0.5)
+                draw.ellipse([pawx-pw, pawy-ph_paw, pawx+pw, pawy+ph_paw], fill=color)
+                # Toe lines
+                # Direction from knee to paw (for toe orientation)
+                tdx = pawx - leg_px[1][0]
+                tdy = pawy - leg_px[1][1]
+                tnm = max(1e-6, np.sqrt(tdx**2 + tdy**2))
+                tdx, tdy = tdx / tnm, tdy / tnm
+                tnx, tny = -tdy, tdx   # perpendicular
+                toe_w = max(1, int(sc * 0.8))
+                toe_len = pw * 0.65
+                for ts in [-0.4, 0.0, 0.4]:
+                    tx = pawx + tnx * ts * pw
+                    ty = pawy + tny * ts * pw
+                    draw.line([(tx, ty), (tx + tdx * toe_len, ty + tdy * toe_len)],
+                              fill=outline_rgb, width=toe_w)
+
+        # ── 2. Far-side legs (behind body) ──
+        for key in back_far:
+            _draw_leg(key, dark_rgb)
+        for key in front_far:
+            _draw_leg(key, dark_rgb)
+
+        # ── 3. Body hull (smooth polygon with outline) ──
         spine_px = [world_to_pixel(pt) for pt in chains['spine']]
         if len(spine_px) >= 2:
             hull = self._make_body_hull(spine_px, body_widths)
             if len(hull) >= 3:
-                draw.polygon(hull, fill=body_rgb)
+                # Body outline (drawn slightly larger)
+                outline_w = max(1, int(1.5 * sc))
+                draw.polygon(hull, fill=body_rgb, outline=outline_rgb)
 
             # Belly highlight (lighter strip along bottom of body)
             belly_widths = [w * 0.5 for w in body_widths]
             belly_hull = self._make_body_hull(spine_px, belly_widths)
             if len(belly_hull) >= 3:
-                # Offset downward slightly
                 offset_hull = [(x, y + body_widths[0] * 0.25) for x, y in belly_hull]
                 draw.polygon(offset_hull, fill=belly_rgb)
 
@@ -304,19 +442,20 @@ class JointedCat:
                                (sx + nx2*w*0.9, sy + ny2*w*0.9)],
                               fill=stripe_rgb, width=sw)
 
-        # ── 5. Front legs (over body) ──
-        for key in ['leg_fl', 'leg_fr']:
-            leg_px = [world_to_pixel(pt) for pt in chains[key]]
-            if len(leg_px) >= 2:
-                draw.line([leg_px[0], leg_px[1]], fill=dark_rgb, width=leg_w)
-                if len(leg_px) >= 3:
-                    draw.line([leg_px[1], leg_px[2]], fill=dark_rgb, width=max(2, leg_w - 1))
-                    fx2, fy2 = leg_px[-1]
-                    pw = max(2, leg_w * 0.8)
-                    ph = max(2, leg_w * 0.5)
-                    draw.ellipse([fx2-pw, fy2-ph, fx2+pw, fy2+ph], fill=dark_rgb)
+        # ── 5. Near-side legs (in front of body) ──
+        # Slightly darker than body so they stand out, but lighter than far legs
+        near_rgb = tuple(int(b * 0.78 + d * 0.22) for b, d in zip(body_rgb, dark_rgb))
+        for key in back_near:
+            _draw_leg(key, near_rgb)
+        for key in front_near:
+            _draw_leg(key, near_rgb)
 
-        # ── 6. Head ──
+        # ── 6. Head (ball-on-rod model) ──
+        # The neck is a rod from shoulders to head center.
+        # head_pan / head_tilt move the rod (FK chain).
+        # head_roll rotates the ball around the rod axis:
+        #   → lateral (ear-to-ear) offsets foreshorten by cos(head_roll)
+        #   → forward (snout) offsets unchanged
         head_px = [world_to_pixel(pt) for pt in chains['head']]
         if len(head_px) >= 2:
             # Neck
@@ -324,109 +463,196 @@ class JointedCat:
             draw.line(head_px[:2], fill=body_rgb, width=neck_w)
 
             hx, hy = head_px[-1]
-            hr = max(4, int(10 * thick * sc))
+            hr = max(4, int(10 * thick * sc * fs))
 
-            # Head direction vector
+            # Rod direction (from FK chain)
             dx = head_px[-1][0] - head_px[-2][0]
             dy = head_px[-1][1] - head_px[-2][1]
             nm = max(1e-6, np.sqrt(dx*dx + dy*dy))
-            fx, fy = dx/nm, dy/nm       # forward direction
-            rx, ry = -fy, fx             # right direction (perpendicular)
+            fx, fy = dx/nm, dy/nm       # rod/forward direction (snout)
+            rx, ry = -fy, fx             # lateral direction (ear-to-ear)
+
+            # Head roll: rotation around rod axis foreshortens lateral extent
+            hroll = p.get('head_roll', 0.0)
+            lat_scale = np.cos(hroll)  # <1 when rolled → face foreshortens
+
+            # Helper: place a point in head-local coords (fwd, lat)
+            # fwd = offset along rod, lat = offset perpendicular to rod
+            def head_pt(fwd, lat):
+                return (hx + fx * fwd + rx * lat * lat_scale,
+                        hy + fy * fwd + ry * lat * lat_scale)
+
+            # Head ellipse: wider ear-to-ear, narrower front-to-back
+            head_a = hr * 1.15 * abs(lat_scale)  # lateral semi-axis foreshortens
+            head_b = hr * 0.88                     # forward semi-axis stays
 
             # ── Ears (pointy triangles with inner ear) ──
             es = hr * 0.85
             for sign in [-1, 1]:
-                # Ear base on side of head
-                bx = hx + sign * rx * hr * 0.55
-                by = hy + sign * ry * hr * 0.55
+                bx, by = head_pt(0, sign * hr * 0.55)
                 # Ear tip: outward + forward
-                tx = bx + sign * rx * es * 0.7 + fx * es * 0.6
-                ty = by + sign * ry * es * 0.7 + fy * es * 0.6
-                # Outer ear
+                tx = bx + sign * rx * es * 0.7 * lat_scale + fx * es * 0.6
+                ty = by + sign * ry * es * 0.7 * lat_scale + fy * es * 0.6
                 draw.polygon([
                     (bx - fx * es * 0.35, by - fy * es * 0.35),
                     (tx, ty),
                     (bx + fx * es * 0.25, by + fy * es * 0.25),
                 ], fill=body_rgb)
-                # Inner ear (smaller, pink)
-                ibx = bx + sign * rx * es * 0.08
-                iby = by + sign * ry * es * 0.08
-                itx = ibx + sign * rx * es * 0.45 + fx * es * 0.38
-                ity = iby + sign * ry * es * 0.45 + fy * es * 0.38
+                # Inner ear
+                ibx, iby = head_pt(0, sign * (hr * 0.55 + es * 0.08))
+                itx = ibx + sign * rx * es * 0.45 * lat_scale + fx * es * 0.38
+                ity = iby + sign * ry * es * 0.45 * lat_scale + fy * es * 0.38
                 draw.polygon([
                     (ibx - fx * es * 0.2, iby - fy * es * 0.2),
                     (itx, ity),
                     (ibx + fx * es * 0.12, iby + fy * es * 0.12),
                 ], fill=inner_ear_rgb)
 
-            # Head circle (drawn after ears so it covers ear bases)
-            draw.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], fill=body_rgb)
+            # Head ellipse (oriented — covers ear bases, with outline)
+            head_pts = self._oriented_ellipse_pts(
+                hx, hy, rx, ry, head_a, head_b, n_pts=32)
+            draw.polygon(head_pts, fill=body_rgb, outline=outline_rgb)
 
-            # ── Eyes (pupils oriented relative to head, not image) ──
+            # ── Eyes (3D sphere projection) ──
+            # The head is a 3D sphere. Eyes are placed at angular positions
+            # on the surface. FACE_TILT angles the face toward the viewer
+            # (z-axis = toward camera). Each eye's visibility = how much its
+            # surface normal points toward the camera.
+            #
+            # 3D basis:  fwd=(fx,fy,0)  lat=(rx,ry,0)  dors=(0,0,1)
+            # Face tilt rotates fwd toward dors by FACE_TILT radians.
+            # head_roll rotates lat/dors around fwd.
+
+            FACE_TILT = 0.35   # ~20° intrinsic tilt toward viewer
+            ct_ft, st_ft = np.cos(FACE_TILT), np.sin(FACE_TILT)
+
+            # Face basis after tilt (fwd tilts toward camera)
+            # face_fwd = ct*fwd + st*dors
+            # face_dors = -st*fwd + ct*dors
+            # After head_roll ψ around fwd:
+            #   face_lat  = cos(ψ)*lat + sin(ψ)*face_dors
+            #   face_dors_r = -sin(ψ)*lat + cos(ψ)*face_dors
+            cr_h, sr_h = np.cos(hroll), np.sin(hroll)
+
+            # z-components of each basis vector (only z matters for visibility)
+            face_fwd_z = st_ft                       # sin(FACE_TILT)
+            face_lat_z = sr_h * (-st_ft * 0 + ct_ft) # sr_h * ct_ft (from face_dors_z)
+            # Actually let me compute properly:
+            # face_dors = (-st_ft*fx, -st_ft*fy, ct_ft)
+            # face_lat = cr_h*(rx,ry,0) + sr_h*(-st_ft*fx, -st_ft*fy, ct_ft)
+            # face_lat_z = sr_h * ct_ft
+            face_lat_z = sr_h * ct_ft
+            # face_dors_r = -sr_h*(rx,ry,0) + cr_h*(-st_ft*fx,-st_ft*fy,ct_ft)
+            # face_dors_r_z = cr_h * ct_ft
+            face_dors_r_z = cr_h * ct_ft
+
+            # 2D components of face basis (for projecting positions)
+            face_fwd_x = ct_ft * fx
+            face_fwd_y = ct_ft * fy
+            face_lat_x = cr_h * rx + sr_h * (-st_ft * fx)
+            face_lat_y = cr_h * ry + sr_h * (-st_ft * fy)
+            face_dors_x = -sr_h * rx + cr_h * (-st_ft * fx)
+            face_dors_y = -sr_h * ry + cr_h * (-st_ft * fy)
+
+            EYE_ALPHA = 0.40   # angular distance from face center
+            EYE_BETA = 0.50    # lateral offset angle
+
             eye_r = max(2, int(3.2 * p['eye_size'] * sc))
+            ca, sa = np.cos(EYE_ALPHA), np.sin(EYE_ALPHA)
+
             for sign in [-1, 1]:
-                # Eye position: offset sideways + slightly forward
-                ex = hx + sign * rx * hr * 0.38 + fx * hr * 0.22
-                ey = hy + sign * ry * hr * 0.38 + fy * hr * 0.22
-                # White of eye (slightly larger)
-                wr = eye_r * 1.15
-                draw.ellipse([ex - wr, ey - wr, ex + wr, ey + wr], fill=(240, 240, 235))
-                # Iris (green/amber)
-                draw.ellipse([ex - eye_r, ey - eye_r, ex + eye_r, ey + eye_r],
-                             fill=(80, 180, 60))
-                # Pupil: vertical slit RELATIVE TO HEAD DIRECTION
-                # The "up" axis of the head is the rx,ry direction
-                # Pupil is elongated along this axis
-                pr = max(1, eye_r * 0.35)
-                ph = max(1, eye_r * 0.85)
-                # Draw as a polygon (4 points of a narrow diamond along head's lateral axis)
+                beta = sign * EYE_BETA
+                sb, cb = np.sin(beta), np.cos(beta)
+
+                # Direction vector of eye on sphere (unit)
+                # d = ca*face_fwd + sa*sb*face_lat + sa*cb*face_dors_r
+                # Visibility = d_z component (toward camera)
+                vis = ca * face_fwd_z + sa * sb * face_lat_z + sa * cb * face_dors_r_z
+                if vis < 0.05:
+                    continue  # eye facing away from camera
+
+                # 2D position (project: ignore z, keep x,y)
+                ex = hx + hr * (ca * face_fwd_x + sa * sb * face_lat_x + sa * cb * face_dors_x)
+                ey = hy + hr * (ca * face_fwd_y + sa * sb * face_lat_y + sa * cb * face_dors_y)
+
+                # Eye size scales with visibility
+                eff = eye_r * vis
+
+                # Eye foreshortening: the eye is an ellipse on the sphere surface.
+                # Along the face_fwd direction it's foreshortened more than laterally.
+                # Compute how much the eye is foreshortened in each face-local axis.
+                # The lateral unit vector in 2D (for orientation)
+                elat_x, elat_y = face_lat_x, face_lat_y
+                efwd_x, efwd_y = face_fwd_x, face_fwd_y
+                elnm = max(1e-6, np.sqrt(elat_x**2 + elat_y**2))
+                elat_x, elat_y = elat_x / elnm, elat_y / elnm
+                efnm = max(1e-6, np.sqrt(efwd_x**2 + efwd_y**2))
+                efwd_x, efwd_y = efwd_x / efnm, efwd_y / efnm
+
+                # Sclera (oriented ellipse: wider laterally, narrower in fwd direction)
+                wr_lat = eff * 1.15           # semi-axis along lateral
+                wr_fwd = eff * 1.15 * vis     # foreshorten along forward by vis
+                wr_fwd = max(wr_fwd, eff * 0.35)  # clamp so it doesn't vanish
+                sclera_pts = self._oriented_ellipse_pts(
+                    ex, ey, elat_x, elat_y, wr_lat, wr_fwd, n_pts=20)
+                draw.polygon(sclera_pts, fill=(240, 240, 235))
+
+                # Iris (slightly smaller oriented ellipse)
+                ir_lat = eff * 0.95
+                ir_fwd = eff * 0.95 * vis
+                ir_fwd = max(ir_fwd, eff * 0.28)
+                iris_pts = self._oriented_ellipse_pts(
+                    ex, ey, elat_x, elat_y, ir_lat, ir_fwd, n_pts=20)
+                draw.polygon(iris_pts, fill=(80, 180, 60))
+
+                # Pupil slit (oriented along face lateral direction)
+                pr = max(1, eff * 0.3)   # width along forward
+                ph = max(1, eff * 0.8)   # height along lateral
                 pupil_pts = [
-                    (ex + rx * ph, ey + ry * ph),  # top of slit (head-relative)
-                    (ex + fx * pr, ey + fy * pr),   # right of slit
-                    (ex - rx * ph, ey - ry * ph),  # bottom of slit
-                    (ex - fx * pr, ey - fy * pr),   # left of slit
+                    (ex + elat_x * ph, ey + elat_y * ph),
+                    (ex + efwd_x * pr, ey + efwd_y * pr),
+                    (ex - elat_x * ph, ey - elat_y * ph),
+                    (ex - efwd_x * pr, ey - efwd_y * pr),
                 ]
                 draw.polygon(pupil_pts, fill=(15, 15, 15))
-                # Specular highlight
-                spr = max(1, eye_r * 0.25)
-                sx = ex + fx * eye_r * 0.2 + rx * eye_r * 0.15
-                sy = ey + fy * eye_r * 0.2 + ry * eye_r * 0.15
-                draw.ellipse([sx - spr, sy - spr, sx + spr, sy + spr],
+
+                # Specular highlight (small circle offset toward top-right)
+                spr = max(1, eff * 0.25)
+                hlt_x = ex + elat_x * eff * 0.2 - efwd_x * eff * 0.15
+                hlt_y = ey + elat_y * eff * 0.2 - efwd_y * eff * 0.15
+                draw.ellipse([hlt_x - spr, hlt_y - spr,
+                              hlt_x + spr, hlt_y + spr],
                              fill=(255, 255, 255))
 
-            # ── Nose (triangular, pink) ──
+            # ── Nose (on rod axis — unaffected by roll) ──
             nose_x = hx + fx * hr * 0.6
             nose_y = hy + fy * hr * 0.6
             nr = max(2, int(2.5 * sc))
             draw.polygon([
                 (nose_x + fx * nr * 0.3, nose_y + fy * nr * 0.3),
-                (nose_x + rx * nr, nose_y + ry * nr),
-                (nose_x - rx * nr, nose_y - ry * nr),
+                head_pt(hr * 0.6, nr),
+                head_pt(hr * 0.6, -nr),
             ], fill=(200, 130, 130))
 
-            # ── Mouth (small lines below nose) ──
+            # ── Mouth ──
             mw = max(1, int(1 * sc))
             mx = nose_x + fx * nr * 0.8
             my = nose_y + fy * nr * 0.8
-            draw.line([(mx, my), (mx + rx * nr * 1.2 + fx * nr * 0.5,
-                                  my + ry * nr * 1.2 + fy * nr * 0.5)],
-                      fill=(160, 100, 100), width=mw)
-            draw.line([(mx, my), (mx - rx * nr * 1.2 + fx * nr * 0.5,
-                                  my - ry * nr * 1.2 + fy * nr * 0.5)],
-                      fill=(160, 100, 100), width=mw)
+            m1x, m1y = head_pt(hr * 0.6 + nr * 1.3, nr * 1.2)
+            m2x, m2y = head_pt(hr * 0.6 + nr * 1.3, -nr * 1.2)
+            draw.line([(mx, my), (m1x, m1y)], fill=(160, 100, 100), width=mw)
+            draw.line([(mx, my), (m2x, m2y)], fill=(160, 100, 100), width=mw)
 
-            # ── Whiskers ──
+            # ── Whiskers (lateral extent foreshortens) ──
             ww = max(1, int(1 * sc))
             whisker_base_r = hr * 0.5
             whisker_len = hr * 1.5
             for sign in [-1, 1]:
-                # 3 whiskers per side
                 for angle_off in [-0.2, 0.0, 0.2]:
-                    wb_x = hx + fx * whisker_base_r * 0.8 + sign * rx * whisker_base_r * 0.5
-                    wb_y = hy + fy * whisker_base_r * 0.8 + sign * ry * whisker_base_r * 0.5
-                    # Whisker direction: mostly sideways + slight forward/angle offset
-                    wd_x = sign * rx + fx * angle_off
-                    wd_y = sign * ry + fy * angle_off
+                    wb_x, wb_y = head_pt(whisker_base_r * 0.8,
+                                         sign * whisker_base_r * 0.5)
+                    wd_x = sign * rx * lat_scale + fx * angle_off
+                    wd_y = sign * ry * lat_scale + fy * angle_off
                     wnm = max(1e-6, np.sqrt(wd_x**2 + wd_y**2))
                     wd_x, wd_y = wd_x / wnm, wd_y / wnm
                     we_x = wb_x + wd_x * whisker_len
@@ -440,18 +666,18 @@ class JointedCat:
 # ═══════════════════════════════════════════════════════════
 # Hierarchy: build the cat → place it → observe it
 #
-#   Level 1: POSE        — intrinsic articulation (spine + limbs + head/tail)
+#   Level 1: POSE        — intrinsic articulation (spine + limbs + head/tail + head roll)
 #   Level 2: APPEARANCE  — surface properties (color, stripes, proportions)
-#   Level 3: PLACEMENT   — cat position & rotation in the scene (SE(2))
+#   Level 3: PLACEMENT   — position R² + full SO(3) rotation (yaw, elevation, roll)
 #   Level 4: CAMERA      — observer transform: zoom, pan, rotation (SE(2)×R+)
-#   Level 5: BACKGROUND  — environment (gradient, colour, intensity)
+#   Level 5: BACKGROUND  — uniform greyscale intensity
 #
 # Generative story: "pose the cat, dress it up, put it somewhere,
 #                     point the camera, choose the backdrop"
 # ═══════════════════════════════════════════════════════════
 
 LEVEL_PARAMS = {
-    1: {  # POSE — all joint angles (15 params)
+    1: {  # POSE — all joint angles + head roll (16 params)
         'spine_0':       (-0.7, 0.7),
         'spine_1':       (-0.6, 0.6),
         'spine_2':       (-0.5, 0.5),
@@ -465,6 +691,7 @@ LEVEL_PARAMS = {
         'leg_fr_lower':  (-1.2, 0.2),
         'head_pan':      (-0.8, 0.8),
         'head_tilt':     (-0.7, 0.7),
+        'head_roll':     (-0.5, 0.5),   # tilt face around neck axis
         'tail_0':        (-1.2, 1.2),
         'tail_1':        (-1.0, 1.0),
     },
@@ -476,10 +703,12 @@ LEVEL_PARAMS = {
         'eye_size':         (0.5, 1.8),
         'stripe_intensity': (0.0, 1.0),
     },
-    3: {  # PLACEMENT — cat in scene: SE(2) (3 params)
-        'root_x':     (-0.4, 0.4),
-        'root_y':     (-0.3, 0.3),
-        'root_angle': (-0.8, 0.8),
+    3: {  # PLACEMENT — R² + SO(3): position + full 3D rotation (5 params)
+        'root_x':         (-0.4, 0.4),
+        'root_y':         (-0.3, 0.3),
+        'root_angle':     (-np.pi, np.pi),     # yaw: in-plane rotation
+        'root_elevation': (-0.8, 0.8),          # pitch: view from above/below
+        'root_roll':      (-0.8, 0.8),          # roll: cat tilts sideways
     },
     4: {  # CAMERA — observation: SE(2)×R+ (4 params)
         'cam_angle':  (-0.4, 0.4),
@@ -487,10 +716,8 @@ LEVEL_PARAMS = {
         'cam_ty':     (-0.25, 0.25),
         'cam_scale':  (0.7, 1.3),
     },
-    5: {  # BACKGROUND — environment (3 params)
-        'bg_angle':        (0.0, 2*np.pi),
-        'bg_colour_shift': (0.0, 1.0),
-        'bg_intensity':    (0.4, 1.0),
+    5: {  # BACKGROUND — uniform greyscale (1 param)
+        'bg_grey':  (0.3, 0.95),
     },
 }
 
@@ -523,6 +750,17 @@ def _check_in_frame(params: Dict[str, float], margin: float = 0.15) -> bool:
         return True
 
     pts = np.array(all_pts)  # (N, 2)
+
+    # Apply 3D rotation foreshortening (must match render(): Rx(e)·Ry(r))
+    root_2d = np.array([params['root_x'], params['root_y']])
+    elev = params.get('root_elevation', 0.0)
+    roll_3d = params.get('root_roll', 0.0)
+    ce, se = np.cos(elev), np.sin(elev)
+    cr, sr = np.cos(roll_3d), np.sin(roll_3d)
+    rel = pts - root_2d
+    x_new = rel[:, 0] * cr + rel[:, 1] * se * sr
+    y_new = rel[:, 1] * ce
+    pts = root_2d + np.column_stack([x_new, y_new])
 
     # Apply camera transform (must match render())
     WORLD_SCALE = 0.40

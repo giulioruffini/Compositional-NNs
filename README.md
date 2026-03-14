@@ -4,80 +4,120 @@
 
 This repository accompanies the technical note *Compositional Dynamic Depth in Neural Networks: A Symmetry-Theoretic Foundation and Experimental Programme* (Ruffini, 2026). It provides:
 
-1. A **2D articulated cat** with a fully controlled 7-level Lie-group compositional hierarchy
-2. A **symmetry-gated residual autoencoder** where each layer has a learnable gate α ∈ [0,1]
-3. A **training and evaluation pipeline** that tests whether gate patterns reflect the compositional complexity of the data-generating process
+1. A **2D articulated cat renderer** (v6) with a fully controlled 5-level Lie-group compositional hierarchy
+2. An **interactive GUI** with 32 sliders to explore the compositional parameter space
+3. A **symmetry-gated residual autoencoder** (v6) where each residual block has a learnable gate
+4. A **training and evaluation pipeline** that tests whether gate patterns reflect compositional complexity
 
-## The idea
+## The Idea
 
-Standard deep networks apply every layer to every input. We argue that depth should be *dynamic and input-dependent*, controlled by how compositionally complex the input is. A static scene under fixed lighting needs fewer layers than an articulated body under changing viewpoint, pose, and appearance.
+Standard deep networks apply every layer to every input. We argue that depth should be *dynamic and input-dependent*, controlled by how compositionally complex the input is. A static scene needs fewer layers than an articulated body under changing viewpoint, pose, and appearance.
 
 The Lie-pseudogroup framework of compositional symmetry (Ruffini 2025, [arXiv:2510.10586](https://arxiv.org/abs/2510.10586)) predicts *which* layers should activate for a given input: layers aligned with inactive symmetry scales should carry near-zero residuals.
 
 This repo tests that prediction using a controlled generative model (the jointed cat) where we know the ground-truth hierarchy.
 
-## The hierarchy
+## The Compositional Hierarchy
 
-The cat's configuration space decomposes into 7 levels:
+The cat's configuration space decomposes into 5 levels, forming a Lie-group flag `G = H₀ ⊃ H₁ ⊃ ... ⊃ H₅`:
 
-| Level | Generators | Parameters |
-|-------|-----------|------------|
-| 1 | Camera SE(2) × R⁺ | rotation, translation, scale |
-| 2 | Root body SE(2) | body position and orientation |
-| 3 | Spine SO(2)³ | 3 spine joints |
-| 4 | Limbs SO(2)⁸ | 2 joints × 4 legs |
-| 5 | Head & tail SO(2)⁴ | head pan/tilt, 2 tail joints |
-| 6 | Appearance R⁶ | colour, thickness, stripes |
-| 7 | Background R³ | gradient, colour, intensity |
+| Level | Name | Group | Params | Description |
+|-------|------|-------|--------|-------------|
+| 0 | Static | Identity | 0 | One fixed cat (reference image) |
+| 1 | Pose | SO(1)¹⁶ | 16 | Spine (3), limbs (8), head pan/tilt/roll (3), tail (2) |
+| 2 | Appearance | R⁶ | 6 | Body colour (HSV), limb thickness, eye size, stripes |
+| 3 | Placement | R² × SO(3) | 5 | Position (x, y) + full 3D rotation (yaw, elevation, roll) |
+| 4 | Camera | SE(2) × R⁺ | 4 | Observer rotation, translation (x, y), zoom |
+| 5 | Background | R¹ | 1 | Uniform greyscale intensity |
 
-Each "condition" activates a subset of levels. The prediction is: more active levels → higher effective depth D_eff = Σ α_ℓ.
+**Total: 32 parameters** across 5 levels.
+
+The generative story: *"pose the cat → dress it up → place it in the scene → point the camera → choose the backdrop."*
+
+### Experimental Conditions
+
+Six conditions activate progressively more levels:
+
+| Condition | Active Levels | Compositional Depth |
+|-----------|--------------|---------------------|
+| `Static` | — | 0 (fixed image) |
+| `PoseOnly` | 1 | 1 |
+| `PoseAppearance` | 1, 2 | 2 |
+| `PosAppPlace` | 1, 2, 3 | 3 |
+| `PosAppPlaceCam` | 1, 2, 3, 4 | 4 |
+| `Everything` | 1, 2, 3, 4, 5 | 5 |
+
+**Prediction:** a gated autoencoder trained on condition with depth *d* should learn to use ≈ *d* active gated blocks.
 
 ## Files
 
 ```
-compositional_cat.py      — Jointed-cat model v1 (legacy)
-compositional_cat_v2.py   — Jointed-cat model v2: bigger cat, wider parameter ranges
-gated_resnet.py           — Symmetry-gated autoencoder v3:
-                              • 1×1 stem and downsampling (forces spatial processing
-                                through gated blocks)
-                              • Gate uses [AvgPool, StdPool] for complexity-aware gating
-                              • Complexity-scaled penalty (simpler inputs → stronger λ)
-train_and_evaluate.py     — Training, evaluation, and plotting v2:
-                              • Mixed-condition training (all 8 conditions, balanced)
-                              • Progressive gate penalty warmup
-                              • Passes per-sample complexity to loss
-dynamic_depth_TN.tex      — LaTeX source for the technical note
-dynamic_depth_TN.pdf      — Compiled technical note
+compositional_cat_v2.py   — Renderer v6: articulated cat with 5-level hierarchy
+cat_gui.py                — Interactive matplotlib GUI with 32 sliders
+gated_resnet.py           — Gated ResNet v6 autoencoder with learned bypass constants
+train_and_evaluate.py     — Per-condition training pipeline + gate analysis
 ```
 
-## Architecture (v3)
+## Quick Start
 
-Three key design choices make the gates meaningful:
-
-1. **Minimal non-gated capacity.** The stem is a 1×1 conv (channel projection only) and downsampling is AvgPool + 1×1 conv. All 3×3 spatial feature extraction lives inside gated residual blocks. This ensures that closing a gate removes actual processing power.
-
-2. **Richer gate conditioning.** Each gate sees `[AvgPool(h), StdPool(h)]` — the spatial standard deviation is a direct proxy for geometric complexity. A static cat has low spatial variance; an articulated cat under camera rotation has high variance.
-
-3. **Complexity-scaled penalty.** During mixed-condition training, each sample's gate penalty is scaled by `(max_levels - n_levels + 1) / max_levels`. Simpler inputs get a stronger push to close gates; complex inputs get more freedom. Combined with a progressive warmup (λ ramps from 0 to λ_max over the first N epochs), this lets the model learn good features before selectively pruning.
-
-## Quickstart
-
-### Setup
+### Prerequisites
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install torch torchvision pillow matplotlib numpy tqdm
+pip install numpy pillow matplotlib scipy  # renderer + GUI
+pip install torch torchvision tqdm         # neural network training
 ```
 
-### Generate a sample grid
+### Generate a Sample Grid
 
 ```bash
-python compositional_cat_v2.py --mode grid --img_size 128 --output_dir dataset
+python compositional_cat_v2.py --mode grid --img_size 192
 ```
 
-This produces `dataset/sample_grid_v2.png` — rows are conditions (Static through Everything), columns are random samples.
+Produces `dataset/sample_grid_v2.png` — 6 rows (one per condition) × 8 random samples.
 
-### Run the full pipeline
+### Interactive GUI
+
+```bash
+python cat_gui.py                          # default 256×256
+python cat_gui.py --img_size 512           # higher resolution
+python cat_gui.py --condition Everything   # start with random params
+```
+
+The GUI groups 32 sliders by hierarchy level with colour coding:
+
+- **Red** — Level 1 Pose: spine joints, leg joints (upper/lower × 4), head pan/tilt/roll, tail joints
+- **Amber** — Level 2 Appearance: body hue/saturation/brightness, limb thickness, eye size, stripe intensity
+- **Green** — Level 3 Placement: position (x, y), yaw (full 360°), elevation, roll
+- **Blue** — Level 4 Camera: rotation, translation (x, y), scale
+- **Grey** — Level 5 Background: grey level
+
+Buttons: **Reset** | **Random All** | **Rand L1** through **Rand L5** (randomise individual levels).
+
+### Generate Training Datasets
+
+```bash
+# Single condition (5000 images at 128×128)
+python compositional_cat_v2.py --mode generate --condition Everything --n_samples 5000 --img_size 128
+
+# All conditions at once
+python compositional_cat_v2.py --mode all --n_samples 5000 --img_size 128
+```
+
+Output structure:
+```
+dataset/
+  Static/
+    images/000000.png ... 004999.png
+    metadata.jsonl
+  PoseOnly/
+    ...
+  Everything/
+    ...
+```
+
+Each `metadata.jsonl` line contains: `index`, `condition`, `active_levels`, `params` (all 32 values), `image` filename.
+
+### Train the Gated Autoencoder
 
 ```bash
 python train_and_evaluate.py \
@@ -96,81 +136,78 @@ python train_and_evaluate.py \
   --output_dir results
 ```
 
-On macOS or without a GPU, use `--device cpu` (training will be slower).
+On macOS or without GPU, use `--device mps` or `--device cpu`.
 
-This trains an 8-layer gated autoencoder on **all conditions simultaneously** (8 × 2000 = 16,000 images), then evaluates gate patterns on each condition. Outputs:
+## Renderer Features (v6)
 
-- `results/gated_autoencoder.pt` — trained model
-- `results/gate_analysis.json` — per-condition gate statistics
-- `results/training_history.json` — epoch-level training metrics
-- `results/dynamic_depth_results.png` — the four prediction plots
-- `results/training_curves.png` — loss, D_eff, and λ schedule
+The v6 renderer includes several physically-motivated features:
 
-## Run online (Colab, Kaggle)
+**Kinematics:**
+- Forward kinematics (Product of Exponentials) for the articulated skeleton: spine → shoulders → head/legs, with separate chains for limbs and tail.
+- Ball-on-rod head model: `head_pan`/`head_tilt` move the neck (FK chain); `head_roll` rotates the face around the neck axis, foreshortening lateral offsets by cos(roll).
 
-If your machine is limited, run the pipeline in the cloud with a free GPU:
+**3D Projection:**
+- Pseudo-3D body rotation via `Rx(elevation) · Ry(roll)` with orthographic projection. The cross-term `x' = x·cos(r) + y·sin(e)·sin(r)` produces correct foreshortening.
+- 3D sphere eye projection: eyes placed at angular positions on the head sphere with intrinsic face tilt toward the viewer. Per-eye visibility from the z-component of the surface normal. Size and shape (oriented ellipses) scale with visibility. Head roll creates natural left/right asymmetry.
 
-- **Kaggle:** Create a new Notebook, then in the **right sidebar → Settings** turn **Accelerator** to **GPU** and **Internet** to **On**. Do **not** run `pip install torch` on Kaggle — it can replace the pre-installed GPU PyTorch with a CPU-only build. Example:
-  ```python
-  !git clone https://github.com/giulioruffini/Compositional-NNs.git
-  %cd Compositional-NNs
-  !pip install -q tqdm
-  !python train_and_evaluate.py \
-      --n_train_per_cond 2000 --n_eval 500 --n_epochs 60 \
-      --gate_warmup 15 --img_size 128 --batch_size 64 \
-      --base_channels 32 --latent_dim 64 --gate_penalty 0.01 \
-      --device cuda --output_dir results
-  ```
+**Rendering quality:**
+- 2× supersampling anti-aliasing (render at double resolution, LANCZOS downsample).
+- Drop shadow under paw positions (grounds the cat in the scene).
+- Thin body and head outlines for definition against similar-hued backgrounds.
+- Cubic-spline interpolated tail for smooth curvature.
+- Depth-ordered limb rendering: near-side vs far-side legs determined by root_angle, drawn at different depths with distinct shading.
+- Paw toe details (small dark lines).
+- Off-screen rejection sampling: `sample_params()` rejects configs where the cat falls outside the frame.
 
-- **Google Colab:** **Runtime → Change runtime type → GPU** (T4), then clone and run as above.
+**Performance:** ~280 images/sec at 128×128 with 2× AA on CPU.
 
-### Generate a dataset to disk
+## Neural Network Architecture (Gated ResNet v6)
 
-```bash
-python compositional_cat_v2.py --mode generate --condition FullPose --n_samples 10000 --img_size 128
-python compositional_cat_v2.py --mode all --n_samples 5000   # all conditions
-```
+The autoencoder (`gated_resnet.py`) uses:
 
-## Key parameters
+- Encoder–decoder with skip connections across matching resolution stages
+- Each residual block has a **learned multiplicative gate** (sigmoid) that can dynamically bypass the block
+- Gate ≈ 0 → block bypassed (effectively reducing network depth)
+- Gate ≈ 1 → block active (full depth utilised)
+- A **learned bypass constant** prevents gate collapse during early training
+- Gate conditioning via `[AvgPool, StdPool]` — spatial variance serves as a complexity signal
+
+## Key Training Parameters
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `--gate_penalty` | 0.05 | Max gate penalty (ramped during warmup). Try {0.005, 0.01, 0.02, 0.05}. |
-| `--gate_warmup` | 10 | Epochs to ramp λ from 0 to max. Lets the model learn features first. |
-| `--gate_init_bias` | 2.0 | Gates start at σ(2.0) ≈ 0.88 (mostly open). Keep at 2.0. |
-| `--n_train_per_cond` | 1000 | Samples per condition. Total training = 8 × this. Use ≥2000 for real runs. |
-| `--img_size` | 64 | Use 128 for real runs. Below 64, gated blocks may not be needed. |
-| `--n_stages` | 4 | Number of encoder stages (each doubles channels). |
-| `--n_blocks` | 2 | Residual blocks per stage. Total gated layers = n_stages × n_blocks. |
+| `--gate_penalty` | 0.01 | Max L1 penalty on gate values. Try {0.005, 0.01, 0.02, 0.05}. |
+| `--gate_warmup` | 15 | Epochs to ramp λ from 0 → max. Lets features form before pruning. |
+| `--n_train_per_cond` | 2000 | Images per condition. Total = 6 × this. Use ≥2000 for real runs. |
+| `--img_size` | 128 | Training resolution. Below 64, gated blocks may not be needed. |
+| `--n_stages` | 4 | Encoder/decoder stages (each doubles channels). |
+| `--n_blocks` | 2 | Residual blocks per stage. Total gates = n_stages × n_blocks. |
 | `--latent_dim` | 64 | Bottleneck dimension. Use 64–128 for img_size=128. |
 
-## What to look for
+## What to Look For
 
-The key output is `dynamic_depth_results.png` with four panels:
+The key output is `dynamic_depth_results.png` with diagnostic plots:
 
-1. **Gate heatmap** — should show a "staircase": more active levels → more layers engaged
-2. **D_eff vs complexity** — should be monotonically increasing (at least for geometric levels 0–5)
-3. **Per-layer profiles** — simple conditions should have lower gate values, especially in early layers
+1. **Gate heatmap** — should show a "staircase": more active levels → more engaged layers
+2. **D_eff vs complexity** — effective depth should increase monotonically (especially for geometric levels)
+3. **Per-layer gate profiles** — simple conditions should have lower gate values
 4. **Reconstruction error** — more complex conditions are harder to reconstruct
 
-Note: appearance (level 6) and background (level 7) are global colour changes that don't require spatial convolution depth. They may not follow the monotonic trend of the geometric levels — this is actually consistent with the theory.
+## Cloud Execution
 
-## Changelog
+**Kaggle:** Create a Notebook with **GPU** accelerator and **Internet** on. Do *not* `pip install torch` — use the pre-installed GPU build:
+```python
+!git clone https://github.com/giulioruffini/Compositional-NNs.git
+%cd Compositional-NNs
+!pip install -q tqdm scipy
+!python train_and_evaluate.py \
+    --n_train_per_cond 2000 --n_eval 500 --n_epochs 60 \
+    --gate_warmup 15 --img_size 128 --batch_size 64 \
+    --base_channels 32 --latent_dim 64 --gate_penalty 0.01 \
+    --device cuda --output_dir results
+```
 
-### v3 (current)
-- **Mixed-condition training** — model sees all complexity levels, not just "Everything"
-- **Minimal non-gated encoder** — 1×1 stem and downsamples; all 3×3 processing is gated
-- **AvgPool + StdPool gating** — spatial variance gives gates a complexity signal
-- **Complexity-scaled penalty** — simpler inputs get stronger gate pressure
-- **Progressive warmup** — λ ramps from 0 to max over first N epochs
-
-### v2
-- Bigger cat (WORLD_SCALE 0.55 vs 0.35), wider parameter ranges
-- Thicker limbs and body for more pixel coverage
-- Vectorised background rendering (10× faster)
-
-### v1
-- Initial implementation with single-condition training on "Everything"
+**Google Colab:** Set **Runtime → Change runtime type → GPU (T4)**, then clone and run as above.
 
 ## References
 

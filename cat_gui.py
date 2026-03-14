@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Interactive Cat GUI — explores the 7-level compositional hierarchy.
+Interactive Cat GUI — explores the 5-level compositional hierarchy.
 
 Uses matplotlib sliders to control each parameter grouped by Lie-group level.
-Directly renders via the v3 JointedCat renderer.
+Directly renders via the v5 JointedCat renderer.
 
 Usage:
     python cat_gui.py                   # default 256px
@@ -34,11 +34,11 @@ from compositional_cat_v2 import (
 # ── Slider layout ──────────────────────────────────────────
 
 LEVEL_NAMES = {
-    1: "L1: Pose  SO(1)¹⁵",
+    1: "L1: Pose  SO(1)¹⁶",
     2: "L2: Appearance  R⁶",
-    3: "L3: Placement  SE(2)",
+    3: "L3: Placement  R²×SO(3)",
     4: "L4: Camera  SE(2)×R⁺",
-    5: "L5: Background  R³",
+    5: "L5: Background  R¹",
 }
 
 # Friendly names for parameters
@@ -49,7 +49,9 @@ PARAM_LABELS = {
     'cam_scale': 'Camera scale',
     'root_x': 'Body X',
     'root_y': 'Body Y',
-    'root_angle': 'Body rotation',
+    'root_angle': 'Yaw (in-plane)',
+    'root_elevation': 'Elevation (pitch)',
+    'root_roll': 'Roll (tilt)',
     'spine_0': 'Spine joint 1',
     'spine_1': 'Spine joint 2',
     'spine_2': 'Spine joint 3',
@@ -63,6 +65,7 @@ PARAM_LABELS = {
     'leg_fr_lower': 'Front-R lower',
     'head_pan': 'Head pan',
     'head_tilt': 'Head tilt',
+    'head_roll': 'Head roll',
     'tail_0': 'Tail joint 1',
     'tail_1': 'Tail joint 2',
     'body_hue': 'Body hue',
@@ -71,9 +74,7 @@ PARAM_LABELS = {
     'limb_thickness': 'Limb thickness',
     'eye_size': 'Eye size',
     'stripe_intensity': 'Stripes',
-    'bg_angle': 'BG gradient angle',
-    'bg_colour_shift': 'BG colour shift',
-    'bg_intensity': 'BG intensity',
+    'bg_grey': 'BG grey level',
 }
 
 
@@ -97,53 +98,61 @@ def build_gui(img_size: int = 256, initial_condition: str = 'Static'):
 
     # ── Figure layout ──
     # Left panel: sliders, Right panel: cat image
-    fig = plt.figure(figsize=(14, 9))
+    # Taller figure to fit 32 sliders without cramping
+    fig = plt.figure(figsize=(14, 11))
     fig.canvas.manager.set_window_title('Compositional Cat — Hierarchy Explorer')
     fig.patch.set_facecolor('#f5f5f0')
 
     # Image axis (right side)
-    ax_img = fig.add_axes([0.48, 0.08, 0.50, 0.85])
+    ax_img = fig.add_axes([0.48, 0.06, 0.50, 0.88])
     ax_img.set_xticks([])
     ax_img.set_yticks([])
 
     # Initial render
     img = cat.render(img_size=img_size)
     img_handle = ax_img.imshow(np.array(img))
-    ax_img.set_title(f'v3 Renderer — {img_size}×{img_size}', fontsize=11)
+    ax_img.set_title(f'v6 Renderer — {img_size}×{img_size}', fontsize=11)
 
-    # Slider axes (left side)
-    slider_height = 0.018
-    slider_gap = 0.004
-    slider_left = 0.12
-    slider_width = 0.30
-    top = 0.95
+    # ── Slider axes (left side) ──
+    # Compact sizing for 32 params + 5 level headers
+    slider_height = 0.016
+    slider_gap = 0.003
+    slider_left = 0.13
+    slider_width = 0.29
+    top = 0.97
 
     sliders = {}
     current_y = top
 
+    header_colors = {1: '#c44', 2: '#a85', 3: '#2a7', 4: '#47c', 5: '#666'}
+    level_colors = {1: '#e88', 2: '#ca8', 3: '#8c8', 4: '#88c', 5: '#aaa'}
+
     prev_level = None
     for pname, lo, hi, level in slider_specs:
-        # Level header
+        # Level header — thin colored separator with label
         if level != prev_level:
-            current_y -= 0.006
-            header_colors = {1: '#c44', 2: '#a85', 3: '#2a7', 4: '#47c', 5: '#666'}
-            fig.text(slider_left - 0.09, current_y, LEVEL_NAMES[level],
-                     fontsize=7, fontweight='bold',
-                     color=header_colors.get(level, '#333'),
-                     verticalalignment='top')
-            current_y -= 0.016
+            if prev_level is not None:
+                current_y -= 0.005  # gap between groups
+            # Draw a thin colored line as separator
+            hc = header_colors.get(level, '#333')
+            fig.add_axes([slider_left, current_y - 0.001, slider_width, 0.001],
+                         facecolor=hc, xticks=[], yticks=[])
+            # Level label to the LEFT of sliders (no overlap)
+            fig.text(0.01, current_y - 0.003, LEVEL_NAMES[level],
+                     fontsize=6.5, fontweight='bold', color=hc,
+                     verticalalignment='top', fontstyle='italic')
+            current_y -= 0.012
             prev_level = level
 
         ax_s = fig.add_axes([slider_left, current_y, slider_width, slider_height])
         label = PARAM_LABELS.get(pname, pname)
-        level_colors = {1: '#e88', 2: '#ca8', 3: '#8c8', 4: '#88c', 5: '#aaa'}
         s = Slider(ax_s, label, lo, hi,
                    valinit=cat.params[pname],
                    valstep=(hi - lo) / 200,
                    color=level_colors.get(level, '#ddd'))
-        ax_s.tick_params(labelsize=5)
+        ax_s.tick_params(labelsize=4)
         for text in ax_s.texts:
-            text.set_fontsize(6)
+            text.set_fontsize(5.5)
 
         sliders[pname] = s
         current_y -= (slider_height + slider_gap)
